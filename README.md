@@ -51,6 +51,12 @@ This repo is the node. Everything else lives next to it:
 | [inazuma-docs](https://github.com/inazuma-network/inazuma-docs) | All written guides: introduction, wallet, staking, building, glossary, FAQ | You want to learn the network in plain English |
 | [inazuma-faucet](https://github.com/inazuma-network/inazuma-faucet) | Faucet service handing out test INAZ, with rate limits | You need test INAZ, or want to run a faucet |
 | [inazuma-contracts](https://github.com/inazuma-network/inazuma-contracts) | WASM contract examples, host ABI, deploy scripts | You are writing smart contracts |
+| [inazuma-improvement-proposals](https://github.com/inazuma-network/inazuma-improvement-proposals) | INAZIPs — written proposals for protocol changes, and the process they follow | You want to change how the chain works |
+
+Project standards live in every repo: [CONTRIBUTING.md](CONTRIBUTING.md),
+[SECURITY.md](SECURITY.md), [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md),
+[SUPPORT.md](SUPPORT.md), [GOVERNANCE.md](GOVERNANCE.md), [ROADMAP.md](ROADMAP.md)
+and [CHANGELOG.md](CHANGELOG.md).
 
 ## Run a node in one command
 
