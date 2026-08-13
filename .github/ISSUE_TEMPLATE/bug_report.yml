@@ -1,0 +1,52 @@
+name: Bug report
+description: Something behaves differently than documented
+labels: [bug, needs-triage]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Do not report security vulnerabilities here.** Email security@inazuma.network instead.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: One or two sentences, plain language.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect instead?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Exact commands or code. Anyone should be able to paste and follow these.
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or error output
+      description: Paste as text, not a screenshot. Remove any secret keys first.
+      render: shell
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      placeholder: v0.1.0 or 385d320
+    validations:
+      required: true
+  - type: input
+    id: env
+    attributes:
+      label: Operating system / environment
+      placeholder: Ubuntu 22.04, 4 vCPU / 8 GB, or Chrome 138 on macOS
+    validations:
+      required: true

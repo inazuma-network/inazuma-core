@@ -1,0 +1,21 @@
+name: Documentation problem
+description: Something is unclear, wrong, or missing
+labels: [documentation, needs-triage]
+body:
+  - type: input
+    id: page
+    attributes:
+      label: Which page or file?
+      placeholder: docs/validator.md, "Staking" section
+    validations:
+      required: true
+  - type: textarea
+    id: issue
+    attributes:
+      label: What was confusing or wrong?
+    validations:
+      required: true
+  - type: textarea
+    id: suggestion
+    attributes:
+      label: What would have helped you?
