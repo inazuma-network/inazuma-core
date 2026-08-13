@@ -1,0 +1,14 @@
+{
+  "chain_id": 7777,
+  "chain_name": "Inazuma",
+  "symbol": "INAZ",
+  "decimals": 9,
+  "block_time_ms": 400,
+  "alloc": [
+    {
+      "address": "7bzhiB8uHTZ7QcJ8CSvV9nZR6GhoyjhYGdxzynregWt2",
+      "balance": "1000000",
+      "stake": null
+    }
+  ]
+}
