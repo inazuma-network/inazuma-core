@@ -49,8 +49,32 @@ hashed into the state root.
 Addresses are base58 over an Ed25519 public key using a domain-separated derivation
 path, so an Inazuma key can never collide with an EVM or another chain's address space.
 Private keys export as `inazkey1`-prefixed base58check, deliberately incompatible with
-other wallets' formats. Accounts may additionally carry ML-DSA-65 (post-quantum)
-co-signatures for signing paths that need to outlive Ed25519.
+other wallets' formats.
+
+One 32-byte master secret produces two signing keys, each derived by hashing the
+secret with a fixed label so neither leaks the other:
+
+```text
+master secret
+  ├── hash("inazuma/v2/ed25519"    ‖ master) ──► Ed25519    32 B key,   64 B signature
+  └── hash("inazuma/v2/pq-mldsa65" ‖ master) ──► ML-DSA-65  1952 B key, 3309 B signature
+```
+
+ML-DSA-65 is the NIST FIPS 204 lattice signature scheme; unlike elliptic curves it is
+not broken by Shor's algorithm. Wallets dual-sign the same canonical transaction bytes
+and attach `pq_scheme`, `pq_pubkey` and `pq_signature`, so the quantum proof of
+authorisation is recorded in block history **today**.
+
+Status, stated precisely: derivation and dual-signing are live; nodes carry the
+quantum fields but do not yet verify or require them. Verification, per-account
+binding, and mandatory co-signatures are consensus changes and ship at activation
+heights — sizing block space and gas for ~5.4 KB transactions is the gating work.
+See the staged post-quantum enforcement draft in
+[inazuma-improvement-proposals](https://github.com/inazuma-network/inazuma-improvement-proposals)
+and the [quantum resistance guide](https://github.com/inazuma-network/inazuma-docs/blob/main/docs/quantum.md).
+
+Hashing and symmetric crypto are unaffected: Grover's algorithm at most halves their
+effective strength, which the SHA-256 and AES-GCM sizes already in use account for.
 
 ## Measured
 
