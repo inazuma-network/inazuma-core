@@ -39,6 +39,19 @@ staking coin — nobody needs to hold another chain's token to validate.
 | Report a vulnerability | [SECURITY.md](SECURITY.md) |
 | Contribute code | [CONTRIBUTING.md](CONTRIBUTING.md) |
 
+## Ecosystem repositories
+
+This repo is the node. Everything else lives next to it:
+
+| Repo | What it is | Use it when |
+| --- | --- | --- |
+| **inazuma-core** (here) | The Rust L1: consensus, state, staking, P2P, JSON-RPC, WASM VM | You run a validator or RPC node, or you want the internals |
+| [inazuma-sdk](https://github.com/inazuma-network/inazuma-sdk) | TypeScript SDK: RPC client, keys, signing, sign-in, state proofs | You are building an app, bot or service |
+| [inazuma-wallet](https://github.com/inazuma-network/inazuma-wallet) | Chrome/Brave/Edge extension + the `window.inazuma` provider | You hold INAZ, or your site needs wallet connect |
+| [inazuma-docs](https://github.com/inazuma-network/inazuma-docs) | All written guides: introduction, wallet, staking, building, glossary, FAQ | You want to learn the network in plain English |
+| [inazuma-faucet](https://github.com/inazuma-network/inazuma-faucet) | Faucet service handing out test INAZ, with rate limits | You need test INAZ, or want to run a faucet |
+| [inazuma-contracts](https://github.com/inazuma-network/inazuma-contracts) | WASM contract examples, host ABI, deploy scripts | You are writing smart contracts |
+
 ## Run a node in one command
 
 Ubuntu 22.04 / Debian 12, 2 vCPU, 4 GB RAM, 50 GB NVMe. The script installs Rust,
