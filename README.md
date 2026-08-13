@@ -28,17 +28,41 @@ staking coin — nobody needs to hold another chain's token to validate.
 | Minimum stake | 1,000 INAZ · unbonding 300 blocks |
 | Measured | ~2,500 tx/s sustained ingestion, 20,000–36,000 tx/s execution |
 
+## Start here
+
+| I want to… | Go to |
+| --- | --- |
+| **Run a validator** (no prior experience needed) | [docs/validator.md](docs/validator.md) |
+| Run a node in one command | [`scripts/install-validator.sh`](scripts/install-validator.sh) |
+| Build an app against the chain | [docs/rpc.md](docs/rpc.md) |
+| Understand how it works internally | [docs/architecture.md](docs/architecture.md) |
+| Report a vulnerability | [SECURITY.md](SECURITY.md) |
+| Contribute code | [CONTRIBUTING.md](CONTRIBUTING.md) |
+
+## Run a node in one command
+
+Ubuntu 22.04 / Debian 12, 2 vCPU, 4 GB RAM, 50 GB NVMe. The script installs Rust,
+builds the node, creates your key, initialises from genesis and installs a systemd
+service that survives reboots:
+
+```bash
+curl -sSf https://raw.githubusercontent.com/inazuma-network/inazuma-core/main/scripts/install-validator.sh | bash
+```
+
+Read-only node instead: `INAZ_ROLE=replica bash install-validator.sh`.
+Re-running upgrades the binary and never touches your key or data.
+
 ## Documentation
 
 | Guide | What's in it |
 | --- | --- |
-| [docs/validator.md](docs/validator.md) | **Run a validator** — hardware, build, keys, genesis, systemd, staking, slashing, troubleshooting |
+| [docs/validator.md](docs/validator.md) | **Run a validator** — server sizing, one-command install, manual install, staking, monitoring, hardening, slashing, troubleshooting, FAQ |
 | [docs/rpc.md](docs/rpc.md) | JSON-RPC methods, WebSocket subscriptions, state proofs, rate limits |
 | [docs/architecture.md](docs/architecture.md) | Module map, consensus, native tokens, key format and quantum posture |
 | [SECURITY.md](SECURITY.md) | Vulnerability disclosure and operator hardening |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Build, test, and the activation-height rule for consensus changes |
 
-## Quick start
+## Quick start (manual build)
 
 ```bash
 git clone https://github.com/inazuma-network/inazuma-core.git
@@ -91,6 +115,7 @@ inazuma bench   --key <SECRET> --count 1000
 ```
 src/            node: crypto, state, consensus, staking, slashing, p2p, rpc, ws, vm
 contracts/      example WASM contract source
+scripts/        one-command validator installer
 genesis.json    genesis allocation and chain parameters
 docs/           validator guide, RPC reference, architecture
 ```
