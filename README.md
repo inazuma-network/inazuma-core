@@ -32,8 +32,8 @@ staking coin — nobody needs to hold another chain's token to validate.
 
 | I want to… | Go to |
 | --- | --- |
-| **Run a validator** (no prior experience needed) | [docs/validator.md](docs/validator.md) |
-| Run a node in one command | [`scripts/install-validator.sh`](scripts/install-validator.sh) |
+| **Run a validator** (no prior experience needed) | [inazuma-validator](https://github.com/inazuma-network/inazuma-validator) |
+| Run a node in one command | [`install-validator.sh`](https://github.com/inazuma-network/inazuma-validator/blob/main/scripts/install-validator.sh) |
 | Build an app against the chain | [docs/rpc.md](docs/rpc.md) |
 | Understand how it works internally | [docs/architecture.md](docs/architecture.md) |
 | Report a vulnerability | [SECURITY.md](SECURITY.md) |
@@ -65,7 +65,7 @@ builds the node, creates your key, initialises from genesis and installs a syste
 service that survives reboots:
 
 ```bash
-curl -sSf https://raw.githubusercontent.com/inazuma-network/inazuma-core/main/scripts/install-validator.sh | bash
+curl -sSf https://raw.githubusercontent.com/inazuma-network/inazuma-validator/main/scripts/install-validator.sh | bash
 ```
 
 Read-only node instead: `INAZ_ROLE=replica bash install-validator.sh`.
@@ -75,7 +75,7 @@ Re-running upgrades the binary and never touches your key or data.
 
 | Guide | What's in it |
 | --- | --- |
-| [docs/validator.md](docs/validator.md) | **Run a validator** — server sizing, one-command install, manual install, staking, monitoring, hardening, slashing, troubleshooting, FAQ |
+| [inazuma-validator](https://github.com/inazuma-network/inazuma-validator) | **Run a validator** — server sizing, one-command install, manual install, staking, monitoring, hardening, slashing, troubleshooting, FAQ |
 | [docs/rpc.md](docs/rpc.md) | JSON-RPC methods, WebSocket subscriptions, state proofs, rate limits |
 | [docs/architecture.md](docs/architecture.md) | Module map, consensus, native tokens, key format and quantum posture |
 | [SECURITY.md](SECURITY.md) | Vulnerability disclosure and operator hardening |
@@ -104,7 +104,7 @@ inazuma validators
 ```
 
 Full walkthrough — firewall rules, encrypted P2P pinning, systemd unit, monitoring and
-recovery from jail — is in **[docs/validator.md](docs/validator.md)**.
+recovery from jail — is in **[inazuma-validator](https://github.com/inazuma-network/inazuma-validator)**.
 
 ## CLI
 
@@ -134,9 +134,8 @@ inazuma bench   --key <SECRET> --count 1000
 ```
 src/            node: crypto, state, consensus, staking, slashing, p2p, rpc, ws, vm
 contracts/      example WASM contract source
-scripts/        one-command validator installer
 genesis.json    genesis allocation and chain parameters
-docs/           validator guide, RPC reference, architecture
+docs/           RPC reference, architecture
 ```
 
 ## Status
