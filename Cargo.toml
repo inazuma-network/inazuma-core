@@ -9,7 +9,7 @@ name = "inazuma"
 path = "src/main.rs"
 
 [dependencies]
-ed25519-dalek = { version = "2", features = ["rand_core"] }
+ed25519-dalek = { version = "3", features = ["rand_core"] }
 sha2 = "0.10"
 hex = "0.4"
 serde = { version = "1", features = ["derive"] }
