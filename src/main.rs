@@ -15,6 +15,7 @@ mod contracts;
 mod crypto;
 mod events;
 mod fees;
+mod fuzz;
 mod journal;
 mod limits;
 mod mempool;
@@ -279,6 +280,23 @@ fn run() -> Result<(), String> {
             if !node.store.is_initialized() {
                 let b = node.init_genesis()?;
                 println!("[init] genesis sealed at height 0 ({})", b.hash);
+            }
+
+            // Integrity alarm before this node touches the network: if the state
+            // on disk no longer hashes to the checkpoint written when the last
+            // block finished, the database changed underneath the chain. Halt
+            // loudly instead of producing or voting on state no peer can
+            // reproduce.
+            if let Err(why) = node.startup_state_root_check() {
+                eprintln!("[ALARM] {}", why);
+                eprintln!("[ALARM] refusing to start. Recover with:");
+                eprintln!(
+                    "        inazuma snapshot-import --data {} --file <snapshot>",
+                    data
+                );
+                eprintln!("        (or wipe the data directory and re-sync from genesis)");
+                node.store.set_halt("state divergence detected at startup");
+                return Err("state divergence".into());
             }
 
             // Merkleized state: built once per database from current state, so an

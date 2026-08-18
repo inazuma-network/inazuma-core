@@ -145,20 +145,27 @@ impl Mempool {
             }
             remaining = still;
         }
-        let picked: HashSet<usize> = chosen.iter().copied().collect();
-        let mut taken: Vec<Transaction> = Vec::with_capacity(picked.len());
-        let mut kept: Vec<PoolTx> = Vec::with_capacity(self.entries.len() - picked.len());
+        // Rank by the order the selection loop accepted them. Returning them in
+        // storage order instead would be a real bug: `entries` is not
+        // nonce-ordered per sender (eviction uses swap_remove, which moves the
+        // last entry into the hole), so a sender's nonce 5 could be handed to the
+        // producer before nonce 4 — the later one then fails execution and gets
+        // dropped from the block for no reason. Caught by a property test.
+        let rank: HashMap<usize, usize> = chosen.iter().copied().zip(0..).collect();
+        let mut taken: Vec<(usize, Transaction)> = Vec::with_capacity(rank.len());
+        let mut kept: Vec<PoolTx> = Vec::with_capacity(self.entries.len() - rank.len());
         for (i, e) in std::mem::take(&mut self.entries).into_iter().enumerate() {
-            if picked.contains(&i) {
+            if let Some(&r) = rank.get(&i) {
                 self.hashes.remove(&e.hash);
                 decrement(&mut self.per_sender, &e.sender);
-                taken.push(e.tx);
+                taken.push((r, e.tx));
             } else {
                 kept.push(e);
             }
         }
         self.entries = kept;
-        taken
+        taken.sort_by_key(|(r, _)| *r);
+        taken.into_iter().map(|(_, tx)| tx).collect()
     }
 
     /// Drop transactions a freshly imported block already confirmed.

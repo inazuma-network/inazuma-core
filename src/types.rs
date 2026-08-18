@@ -188,7 +188,7 @@ pub enum TxKind {
 }
 
 impl TxKind {
-    fn tag(&self) -> &'static str {
+    pub fn tag(&self) -> &'static str {
         match self {
             TxKind::Transfer => "transfer",
             TxKind::Stake => "stake",
@@ -270,6 +270,27 @@ pub fn delimiter_free(s: &str) -> bool {
     !s.contains('|')
 }
 
+/// Canonical, length-prefixed encoding of a signed field.
+///
+/// The `|`-joined preimage above is unambiguous only because every signed
+/// string is checked for `|` first — a validation band-aid rather than an
+/// encoding. This is the real fix: each field is written as its byte length
+/// (u32, big endian) followed by its bytes, so no field content can ever shift
+/// another field's boundary, whatever characters it contains.
+pub fn push_field(buf: &mut Vec<u8>, bytes: &[u8]) {
+    buf.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+    buf.extend_from_slice(bytes);
+}
+
+fn push_str(buf: &mut Vec<u8>, s: &str) {
+    push_field(buf, s.as_bytes());
+}
+
+/// Domain tag for the canonical transaction preimage. Distinct from the legacy
+/// `inazuma-tx|...` prefix, so a signature over one encoding can never be
+/// reinterpreted as a signature over the other.
+pub const TX_DOMAIN_V2: &[u8] = b"inazuma-tx-v2";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Transaction {
     pub kind: TxKind,
@@ -324,6 +345,39 @@ impl Transaction {
         }
     }
 
+    /// Canonical (v2) preimage: domain tag plus every field length-prefixed.
+    /// Structurally unambiguous, so it needs no `|` validation at all.
+    ///
+    /// Both encodings are accepted by `verify_signature` during the migration:
+    /// history signed with the legacy preimage must keep replaying byte-identically,
+    /// while new signers (node CLI, wallet, extension) can move to v2 without a
+    /// coordinated fork. The legacy path stays guarded by `fields_unambiguous`.
+    pub fn canonical_signing_bytes(&self) -> Vec<u8> {
+        let mut b = Vec::with_capacity(256);
+        push_field(&mut b, TX_DOMAIN_V2);
+        b.extend_from_slice(&self.chain_id.to_be_bytes());
+        push_str(&mut b, self.kind.tag());
+        push_str(&mut b, &self.from_pubkey);
+        push_str(&mut b, &self.to);
+        b.extend_from_slice(&self.amount.to_be_bytes());
+        b.extend_from_slice(&self.fee.to_be_bytes());
+        b.extend_from_slice(&self.nonce.to_be_bytes());
+        match &self.payload {
+            None => b.push(0),
+            Some(p) => {
+                b.push(1);
+                push_str(&mut b, &p.token);
+                push_str(&mut b, &p.symbol);
+                push_str(&mut b, &p.name);
+                b.push(p.decimals);
+                b.push(u8::from(p.mintable));
+                push_str(&mut b, &p.code);
+                push_str(&mut b, &p.args);
+            }
+        }
+        b
+    }
+
     pub fn hash(&self) -> String {
         let mut b = self.signing_bytes();
         b.extend_from_slice(self.signature.as_bytes());
@@ -341,6 +395,14 @@ impl Transaction {
     }
 
     pub fn verify_signature(&self) -> bool {
+        // v2 first: it is unambiguous by construction.
+        if verify(
+            &self.from_pubkey,
+            &self.canonical_signing_bytes(),
+            &self.signature,
+        ) {
+            return true;
+        }
         self.fields_unambiguous()
             && verify(&self.from_pubkey, &self.signing_bytes(), &self.signature)
     }

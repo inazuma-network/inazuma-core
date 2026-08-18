@@ -46,6 +46,26 @@ pub const MAX_TIMESTAMP_DRIFT_MS: u128 = 12_000;
 /// Timestamps must strictly increase, so a producer can neither replay a
 /// parent's slot window nor drag the chain clock backwards.
 pub const MIN_TIMESTAMP_SPACING_MS: u128 = 1;
+/// Deepest unwind a node will perform on its own. Finality already refuses to
+/// discard finalized history, but an unfinalized tip could in principle be
+/// rolled back arbitrarily far by a peer claiming a longer chain — that is the
+/// shape of a long-range attack. Beyond this many blocks the node stops and
+/// asks an operator instead of silently rewriting its own history.
+pub const MAX_REORG_DEPTH: u64 = 5_000;
+
+/// Consensus rule for how deep an automatic unwind may go. Pure, so it can be
+/// tested and fuzzed directly.
+pub fn check_reorg_depth(local_tip: u64, peer_height: u64) -> Result<(), String> {
+    let depth = local_tip.saturating_sub(peer_height);
+    if depth > MAX_REORG_DEPTH {
+        return Err(format!(
+            "refusing {}-block reorg (local tip {}, peer {}); max automatic depth is {}. \
+             An operator must review this fork and re-sync deliberately.",
+            depth, local_tip, peer_height, MAX_REORG_DEPTH
+        ));
+    }
+    Ok(())
+}
 
 pub fn now_ms() -> u128 {
     SystemTime::now()
@@ -823,6 +843,7 @@ impl Node {
         self.store.flush_tokens();
         self.store.flush_contracts();
         self.mark_tip_seen();
+        self.checkpoint_state(block.height);
         if let Some(h) = self.votes.replay_pending(&self.store, block.height) {
             println!("[final] height {} finalized", h);
         }
@@ -844,7 +865,10 @@ impl Node {
         self.store.begin_block();
         let outcome = self.import_block_inner(block);
         match &outcome {
-            Ok(_) => self.store.commit_block(),
+            Ok(_) => {
+                self.store.commit_block();
+                self.checkpoint_state(block.height);
+            }
             Err(_) => self.store.abort_block(),
         }
         outcome
@@ -964,6 +988,42 @@ impl Node {
         Ok(true)
     }
 
+    /// Record the at-rest state hash for the height just applied. Cheap relative
+    /// to a block, and it is what makes the startup alarm below possible.
+    pub fn checkpoint_state(&self, height: u64) {
+        let root = self.store.state_root();
+        self.store.set_state_checkpoint(height, &root);
+    }
+
+    /// Startup integrity alarm: the state on disk must hash to exactly what this
+    /// node recorded when it last finished a block. A mismatch means the database
+    /// silently changed underneath the chain — a torn write, a half-applied block
+    /// from a killed process, an edited or badly imported snapshot. Such a node
+    /// produces blocks no peer can accept and votes on state nobody else has, so
+    /// it must refuse to start rather than quietly fork.
+    pub fn startup_state_root_check(&self) -> Result<(), String> {
+        let tip = self.store.tip_height().unwrap_or(0);
+        let Some((height, expected)) = self.store.state_checkpoint() else {
+            // First run on this binary: adopt the current state as the baseline.
+            self.checkpoint_state(tip);
+            return Ok(());
+        };
+        if height != tip {
+            // The checkpoint is from another height (e.g. a crash between the
+            // block write and the checkpoint write). Not divergence by itself.
+            self.checkpoint_state(tip);
+            return Ok(());
+        }
+        let local = self.store.state_root();
+        if local != expected {
+            return Err(format!(
+                "state divergence at height {}: last checkpoint was {} but state on disk hashes to {}",
+                height, expected, local
+            ));
+        }
+        Ok(())
+    }
+
     /// Wipe local state back to genesis so the node can replay a peer's chain.
     /// Refused if it would discard a height this node already finalized.
     pub fn reset_to_genesis(&self, peer_height: u64) -> Result<(), String> {
@@ -975,6 +1035,8 @@ impl Node {
                 finalized, peer_height
             ));
         }
+        // Bound the unwind even when nothing is finalized yet.
+        check_reorg_depth(self.store.tip_height().unwrap_or(0), peer_height)?;
         self.store.reset_chain();
         self.mempool.lock().unwrap().clear();
         drop(_exec);

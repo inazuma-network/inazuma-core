@@ -796,6 +796,28 @@ impl Store {
         let _ = self.meta.flush();
     }
 
+    /// Integrity checkpoint: the hash of the whole state *at rest*, written at
+    /// the end of every sealed or imported block. It is deliberately not the
+    /// block's `state_root` — post-execution accounting (producer rewards,
+    /// finality bookkeeping) lands after the root is committed to, so the at-rest
+    /// state legitimately differs from the header. Comparing this value on
+    /// startup catches what actually goes wrong in the field: a torn write, a
+    /// half-applied block from a killed process, or a bad snapshot import.
+    pub fn state_checkpoint(&self) -> Option<(u64, String)> {
+        let v = self.meta.get(b"state_checkpoint").ok().flatten()?;
+        let s = String::from_utf8(v.to_vec()).ok()?;
+        let (h, root) = s.split_once(':')?;
+        Some((h.parse().ok()?, root.to_string()))
+    }
+
+    pub fn set_state_checkpoint(&self, height: u64, root: &str) {
+        let _ = self.meta.insert(
+            b"state_checkpoint",
+            format!("{}:{}", height, root).as_bytes(),
+        );
+        let _ = self.meta.flush();
+    }
+
     /// Clear accounts, blocks and indexes so the chain can be replayed from
     /// genesis. The finalized height is kept as a safety floor.
     pub fn reset_chain(&self) {
@@ -812,6 +834,7 @@ impl Store {
         let _ = self.smt_nodes.clear();
         let _ = self.meta.remove(b"tip_height");
         let _ = self.meta.remove(b"tip_hash");
+        let _ = self.meta.remove(b"state_checkpoint");
         let _ = self.accounts.flush();
         let _ = self.blocks.flush();
         let _ = self.txs.flush();

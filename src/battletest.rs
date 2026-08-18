@@ -1121,6 +1121,39 @@ fn failed_tx_leaves_no_partial_state() {
 }
 // ---------------------------------------------------- snapshots, pruning, halt
 
+/// The startup alarm's core comparison: the recorded at-rest checkpoint must
+/// still match the state on disk, and must stop matching the moment anything
+/// edits state outside block execution (a torn write, a tampered database).
+#[test]
+fn state_checkpoint_detects_out_of_band_state_edits() {
+    let st = store();
+    st.set_account(
+        "alice",
+        &Account {
+            balance: 1_000,
+            ..Account::default()
+        },
+    );
+    let root = st.state_root();
+    st.set_state_checkpoint(10, &root);
+    assert_eq!(st.state_checkpoint(), Some((10, root.clone())));
+    assert_eq!(st.state_root(), root, "untouched state still matches");
+
+    // Somebody edits an account without a block having applied it.
+    st.set_account(
+        "alice",
+        &Account {
+            balance: 999_999,
+            ..Account::default()
+        },
+    );
+    assert_ne!(
+        st.state_root(),
+        st.state_checkpoint().unwrap().1,
+        "out-of-band state edit must break the checkpoint"
+    );
+}
+
 /// Builds a small live state at `height` and a matching sealed block.
 fn state_at(store: &Store, kp: &Keypair, height: u64) -> Block {
     bond(store, kp, MIN_STAKE);
