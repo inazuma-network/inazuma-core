@@ -6,8 +6,8 @@ use crate::crypto::is_valid_address;
 use crate::fees::{self, FEE_MARKET_ACTIVATION_HEIGHT};
 use crate::limits::{ConnGuard, IpConnCounter};
 use crate::rpcauth::{self, RpcConfig, Tier};
-use crate::staking;
 use crate::slashing::{self, Evidence};
+use crate::staking;
 use crate::tokens::{self, format_units};
 use crate::types::{
     format_inaz, Block, Payload, Transaction, TxKind, DOWNTIME_JAIL_BLOCKS, DOWNTIME_JAIL_STREAK,
@@ -38,7 +38,13 @@ pub fn serve_with(node: Arc<Node>, addr: &str, cfg: Arc<RpcConfig>) -> Result<()
     println!("[rpc] listening on http://{}", addr);
     println!(
         "[rpc] auth {} ({} keys), rate {}/s anon and {}/s keyed, {} conns per ip",
-        if cfg.require_auth { "required" } else if cfg.auth_enabled() { "optional" } else { "off" },
+        if cfg.require_auth {
+            "required"
+        } else if cfg.auth_enabled() {
+            "optional"
+        } else {
+            "off"
+        },
         cfg.key_count(),
         rpcauth::ANON_RATE,
         rpcauth::KEY_RATE,
@@ -114,7 +120,10 @@ fn handle_conn(
         // Header names are case-insensitive; values are not, so slice the raw line.
         if lower.starts_with("authorization:") {
             let raw = line[line.find(':').map(|i| i + 1).unwrap_or(0)..].trim();
-            let token = raw.strip_prefix("Bearer ").or_else(|| raw.strip_prefix("bearer ")).unwrap_or(raw);
+            let token = raw
+                .strip_prefix("Bearer ")
+                .or_else(|| raw.strip_prefix("bearer "))
+                .unwrap_or(raw);
             if !token.is_empty() {
                 credential = Some(token.to_string());
             }
@@ -130,7 +139,11 @@ fn handle_conn(
     }
     let mut body = buf[he + 4..].to_vec();
     if content_length > RPC_MAX_BODY {
-        return respond(&mut stream, 413, &json!({ "error": "body too large" }).to_string());
+        return respond(
+            &mut stream,
+            413,
+            &json!({ "error": "body too large" }).to_string(),
+        );
     }
     while body.len() < content_length {
         let read = stream.read(&mut chunk).map_err(|e| e.to_string())?;
@@ -156,7 +169,11 @@ fn handle_conn(
     if http_method == "GET" {
         // Health/discovery stays open but is still metered.
         if !cfg.charge(client_ip, tier, credential.as_deref(), 1.0) {
-            return respond(&mut stream, 429, &json!({ "error": "rate limited" }).to_string());
+            return respond(
+                &mut stream,
+                429,
+                &json!({ "error": "rate limited" }).to_string(),
+            );
         }
         let payload = match path {
             "/health" => json!({ "ok": true, "height": node.store.tip_height().unwrap_or(0) }),
@@ -185,8 +202,10 @@ fn handle_conn(
                 .to_string(),
         );
     }
-    // 2. Authorization: operator-only methods need an admin key.
-    if rpcauth::PRIVILEGED_METHODS.contains(&method) && cfg.auth_enabled() && tier != Tier::Admin {
+    // 2. Authorization: operator-only methods need an admin key. This fails
+    // closed — a node with no admin key configured refuses them outright
+    // instead of publishing them to anonymous callers.
+    if rpcauth::PRIVILEGED_METHODS.contains(&method) && tier != Tier::Admin {
         return respond(
             &mut stream,
             403,
@@ -210,7 +229,9 @@ fn handle_conn(
 
     let out = match dispatch_metered(&node, method, &params, &cfg, tier) {
         Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
-        Err(msg) => json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32000, "message": msg } }),
+        Err(msg) => {
+            json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32000, "message": msg } })
+        }
     };
     respond(&mut stream, 200, &out.to_string())
 }
@@ -273,6 +294,78 @@ pub fn dispatch_metered(
                 "trackedAccounts": cfg.accounts.tracked(),
             }));
         }
+        // Emergency halt controls. Admin-gated by PRIVILEGED_METHODS.
+        "inaz_halt" => {
+            let reason = params
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("operator halt");
+            node.halt(reason);
+            return Ok(json!({
+                "halted": true,
+                "reason": node.store.halt_reason(),
+                "height": node.store.tip_height().unwrap_or(0),
+                "finalizedHeight": node.store.finalized_height(),
+            }));
+        }
+        "inaz_resume" => {
+            node.resume();
+            return Ok(json!({ "halted": false, "height": node.store.tip_height().unwrap_or(0) }));
+        }
+        "inaz_prune" => {
+            let keep = params
+                .get("keep")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(crate::DEFAULT_PRUNE_KEEP);
+            let finalized = node.store.finalized_height();
+            let removed = node.store.prune_blocks(finalized.saturating_sub(keep));
+            return Ok(json!({
+                "removedBlocks": removed,
+                "prunedBelow": node.store.pruned_below(),
+                "keep": keep,
+                "finalizedHeight": finalized,
+            }));
+        }
+        // Network security surface. Every caller may confirm the transport is
+        // encrypted and see how many peers are authenticated, because that is
+        // the honest security posture of a public node. Peer IP addresses, the
+        // dial list and the node-key allowlist are operator data: publishing
+        // them hands an attacker a validator map for a targeted DoS or eclipse
+        // attempt, so they only appear for an admin key.
+        "inaz_netInfo" => {
+            let full = rpcauth::may_see_topology(tier);
+            let Some(net) = node.gossip_handle() else {
+                return Ok(json!({ "transport": "disabled", "peerCount": 0 }));
+            };
+            let identities = net.book.known_identities();
+            let mut out = json!({
+                "transport": "INSC1 (X25519 + ed25519 auth + ChaCha20-Poly1305)",
+                "encryptionRequired": net.require_encryption,
+                "nodeKey": net.id.pubkey_hex(),
+                "peerCount": net.peers.len(),
+                "authenticatedPeerCount": identities.len(),
+                "allowlistEnforced": !net.allowed_ids.is_empty(),
+                "bannedHosts": net.book.banned_count(),
+                "detailVisibility": if full { "admin" } else { "redacted" },
+            });
+            if full {
+                let map = out.as_object_mut().expect("object");
+                map.insert("listen".into(), json!(net.listen));
+                map.insert("peers".into(), json!(net.peers));
+                map.insert(
+                    "allowlist".into(),
+                    json!(net.allowed_ids.iter().cloned().collect::<Vec<_>>()),
+                );
+                map.insert(
+                    "authenticatedPeers".into(),
+                    json!(identities
+                        .iter()
+                        .map(|(ip, id)| json!({ "ip": ip.to_string(), "nodeKey": id }))
+                        .collect::<Vec<_>>()),
+                );
+            }
+            return Ok(out);
+        }
         _ => {}
     }
     dispatch(node, method, params)
@@ -296,8 +389,12 @@ fn respond(stream: &mut TcpStream, status: u16, body: &str) -> Result<(), String
         reason,
         body.len()
     );
-    stream.write_all(head.as_bytes()).map_err(|e| e.to_string())?;
-    stream.write_all(body.as_bytes()).map_err(|e| e.to_string())?;
+    stream
+        .write_all(head.as_bytes())
+        .map_err(|e| e.to_string())?;
+    stream
+        .write_all(body.as_bytes())
+        .map_err(|e| e.to_string())?;
     stream.flush().map_err(|e| e.to_string())
 }
 
@@ -388,8 +485,22 @@ fn dispatch(node: &Arc<Node>, method: &str, params: &Value) -> Result<Value, Str
                 "contracts": node.store.contract_count(),
                 "deployFee": format_inaz(contracts::DEPLOY_FEE),
                 "vm": "wasm",
+                "halted": node.halted(),
+                "haltReason": node.store.halt_reason(),
+                "prunedBelow": node.store.pruned_below(),
+                "maxValidators": staking::MAX_VALIDATORS,
+                "validatorCapHeight": staking::VALIDATOR_CAP_ACTIVATION_HEIGHT,
             }))
         }
+        // Public: anyone may see that a node is frozen or missing history.
+        "inaz_haltStatus" => Ok(json!({
+            "halted": node.halted(),
+            "reason": node.store.halt_reason(),
+            "height": node.store.tip_height().unwrap_or(0),
+            "finalizedHeight": node.store.finalized_height(),
+            "prunedBelow": node.store.pruned_below(),
+            "archive": node.store.pruned_below() == 0,
+        })),
         "inaz_tokens" => {
             let list = node.store.tokens();
             Ok(json!({
@@ -399,7 +510,10 @@ fn dispatch(node: &Arc<Node>, method: &str, params: &Value) -> Result<Value, Str
             }))
         }
         "inaz_getToken" => {
-            let id = params.get("token").and_then(|v| v.as_str()).ok_or("missing token")?;
+            let id = params
+                .get("token")
+                .and_then(|v| v.as_str())
+                .ok_or("missing token")?;
             match node.store.token(id) {
                 Some(t) => {
                     let mut v = token_json(&t);
@@ -419,8 +533,14 @@ fn dispatch(node: &Arc<Node>, method: &str, params: &Value) -> Result<Value, Str
             }
         }
         "inaz_tokenBalance" => {
-            let id = params.get("token").and_then(|v| v.as_str()).ok_or("missing token")?;
-            let addr = params.get("address").and_then(|v| v.as_str()).ok_or("missing address")?;
+            let id = params
+                .get("token")
+                .and_then(|v| v.as_str())
+                .ok_or("missing token")?;
+            let addr = params
+                .get("address")
+                .and_then(|v| v.as_str())
+                .ok_or("missing address")?;
             let token = node.store.token(id).ok_or("unknown token")?;
             let bal = node.store.token_balance(id, addr);
             Ok(json!({
@@ -432,7 +552,10 @@ fn dispatch(node: &Arc<Node>, method: &str, params: &Value) -> Result<Value, Str
             }))
         }
         "inaz_tokenHoldings" => {
-            let addr = params.get("address").and_then(|v| v.as_str()).ok_or("missing address")?;
+            let addr = params
+                .get("address")
+                .and_then(|v| v.as_str())
+                .ok_or("missing address")?;
             if !is_valid_address(addr) {
                 return Err("invalid address".into());
             }
@@ -447,26 +570,6 @@ fn dispatch(node: &Arc<Node>, method: &str, params: &Value) -> Result<Value, Str
                     "balanceFormatted": format_units(bal, t.decimals),
                 })).collect::<Vec<_>>(),
             }))
-        }
-        // Network security surface: is the encrypted transport in force, who is
-        // authenticated, and how many hosts are currently banned.
-        "inaz_netInfo" => {
-            let net = node.gossip_handle();
-            Ok(match net {
-                Some(net) => json!({
-                    "transport": "INSC1 (X25519 + ed25519 auth + ChaCha20-Poly1305)",
-                    "encryptionRequired": net.require_encryption,
-                    "nodeKey": net.id.pubkey_hex(),
-                    "listen": net.listen,
-                    "peers": net.peers,
-                    "allowlist": net.allowed_ids.iter().cloned().collect::<Vec<_>>(),
-                    "authenticatedPeers": net.book.known_identities().iter()
-                        .map(|(ip, id)| json!({ "ip": ip.to_string(), "nodeKey": id }))
-                        .collect::<Vec<_>>(),
-                    "bannedHosts": net.book.banned_count(),
-                }),
-                None => json!({ "transport": "disabled", "peers": [] }),
-            })
         }
         "inaz_blockNumber" => Ok(json!(node.store.tip_height().unwrap_or(0))),
         // Fee market: what a transaction must pay right now, and how the base
@@ -488,7 +591,10 @@ fn dispatch(node: &Arc<Node>, method: &str, params: &Value) -> Result<Value, Str
         }
         // Light-client Merkle proof for one state leaf.
         "inaz_getProof" => {
-            let domain = params.get("domain").and_then(|v| v.as_str()).unwrap_or("acct");
+            let domain = params
+                .get("domain")
+                .and_then(|v| v.as_str())
+                .unwrap_or("acct");
             let key = params
                 .get("key")
                 .or_else(|| params.get("address"))
@@ -513,14 +619,30 @@ fn dispatch(node: &Arc<Node>, method: &str, params: &Value) -> Result<Value, Str
         }
         // Stateless proof check, so bridges can sanity-check their own verifier.
         "inaz_verifyProof" => {
-            let domain = params.get("domain").and_then(|v| v.as_str()).unwrap_or("acct");
-            let key = params.get("key").and_then(|v| v.as_str()).ok_or("key required")?;
-            let root = params.get("root").and_then(|v| v.as_str()).ok_or("root required")?;
-            let bitmap = params.get("siblingBitmap").and_then(|v| v.as_str()).unwrap_or("");
+            let domain = params
+                .get("domain")
+                .and_then(|v| v.as_str())
+                .unwrap_or("acct");
+            let key = params
+                .get("key")
+                .and_then(|v| v.as_str())
+                .ok_or("key required")?;
+            let root = params
+                .get("root")
+                .and_then(|v| v.as_str())
+                .ok_or("root required")?;
+            let bitmap = params
+                .get("siblingBitmap")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let siblings: Vec<String> = params
                 .get("siblings")
                 .and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|s| s.as_str().map(|s| s.to_string())).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|s| s.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
                 .unwrap_or_default();
             let value = match params.get("value").and_then(|v| v.as_str()) {
                 Some(h) if !h.is_empty() => Some(hex::decode(h).map_err(|_| "bad value hex")?),
@@ -643,7 +765,11 @@ fn dispatch(node: &Arc<Node>, method: &str, params: &Value) -> Result<Value, Str
         // Slashing parameters, jail state and every punishment ever applied.
         "inaz_slashing" => {
             let height = node.store.tip_height().unwrap_or(0) + 1;
-            let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(50).min(500) as usize;
+            let limit = params
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(50)
+                .min(500) as usize;
             let records = node.store.slashes();
             let burned: u128 = records.iter().map(|r| r.burned).sum();
             Ok(json!({
@@ -719,7 +845,11 @@ fn dispatch(node: &Arc<Node>, method: &str, params: &Value) -> Result<Value, Str
             }
         }
         "inaz_latestBlocks" => {
-            let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(10).min(100);
+            let limit = params
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(10)
+                .min(100);
             let tip = node.store.tip_height().unwrap_or(0);
             let mut out = Vec::new();
             let mut h = tip as i64;
@@ -732,7 +862,10 @@ fn dispatch(node: &Arc<Node>, method: &str, params: &Value) -> Result<Value, Str
             Ok(json!(out))
         }
         "inaz_getTransaction" => {
-            let hash = params.get("hash").and_then(|v| v.as_str()).ok_or("missing hash")?;
+            let hash = params
+                .get("hash")
+                .and_then(|v| v.as_str())
+                .ok_or("missing hash")?;
             match node.store.tx_height(hash) {
                 Some(h) => {
                     let block = node.store.block(h).ok_or("block missing")?;
@@ -759,7 +892,10 @@ fn dispatch(node: &Arc<Node>, method: &str, params: &Value) -> Result<Value, Str
             }))
         }
         "inaz_getContract" => {
-            let addr = params.get("address").and_then(|v| v.as_str()).ok_or("missing address")?;
+            let addr = params
+                .get("address")
+                .and_then(|v| v.as_str())
+                .ok_or("missing address")?;
             match node.store.contract(addr) {
                 Some(c) => {
                     let mut v = contract_json(&c);
@@ -781,8 +917,14 @@ fn dispatch(node: &Arc<Node>, method: &str, params: &Value) -> Result<Value, Str
             }
         }
         "inaz_contractStorage" => {
-            let addr = params.get("address").and_then(|v| v.as_str()).ok_or("missing address")?;
-            let key = params.get("key").and_then(|v| v.as_str()).ok_or("missing key")?;
+            let addr = params
+                .get("address")
+                .and_then(|v| v.as_str())
+                .ok_or("missing address")?;
+            let key = params
+                .get("key")
+                .and_then(|v| v.as_str())
+                .ok_or("missing key")?;
             let val = node.store.contract_storage(addr, key);
             Ok(json!({
                 "address": addr,
@@ -793,7 +935,10 @@ fn dispatch(node: &Arc<Node>, method: &str, params: &Value) -> Result<Value, Str
             }))
         }
         "inaz_getReceipt" => {
-            let hash = params.get("hash").and_then(|v| v.as_str()).ok_or("missing hash")?;
+            let hash = params
+                .get("hash")
+                .and_then(|v| v.as_str())
+                .ok_or("missing hash")?;
             match node.store.receipt(hash) {
                 Some(r) => Ok(json!({
                     "hash": hash,
@@ -812,11 +957,20 @@ fn dispatch(node: &Arc<Node>, method: &str, params: &Value) -> Result<Value, Str
         }
         // Read-only contract call: runs the code, throws every state change away.
         "inaz_query" => {
-            let addr = params.get("address").and_then(|v| v.as_str()).ok_or("missing address")?;
+            let addr = params
+                .get("address")
+                .and_then(|v| v.as_str())
+                .ok_or("missing address")?;
             let c = contracts::check_call(&node.store, addr)?;
-            let code = node.store.code(&c.code_hash).ok_or("contract code missing")?;
+            let code = node
+                .store
+                .code(&c.code_hash)
+                .ok_or("contract code missing")?;
             let args = params.get("args").and_then(|v| v.as_str()).unwrap_or("");
-            let input = contracts::decode_args(&Some(Payload { args: args.to_string(), ..Default::default() }))?;
+            let input = contracts::decode_args(&Some(Payload {
+                args: args.to_string(),
+                ..Default::default()
+            }))?;
             let caller = params
                 .get("caller")
                 .and_then(|v| v.as_str())
@@ -846,7 +1000,8 @@ fn dispatch(node: &Arc<Node>, method: &str, params: &Value) -> Result<Value, Str
         }
         "inaz_sendTransaction" => {
             let raw = params.get("tx").cloned().unwrap_or_else(|| params.clone());
-            let tx: Transaction = serde_json::from_value(raw).map_err(|e| format!("bad tx: {}", e))?;
+            let tx: Transaction =
+                serde_json::from_value(raw).map_err(|e| format!("bad tx: {}", e))?;
             let predicted = match tx.kind {
                 TxKind::DeployContract => {
                     let code = contracts::decode_code(&tx.payload)?;
@@ -924,7 +1079,8 @@ fn dispatch(node: &Arc<Node>, method: &str, params: &Value) -> Result<Value, Str
         // nonce or a short balance before it ever pays for a failed submission.
         "inaz_simulateTransaction" => {
             let raw = params.get("tx").cloned().unwrap_or_else(|| params.clone());
-            let tx: Transaction = serde_json::from_value(raw).map_err(|e| format!("bad tx: {}", e))?;
+            let tx: Transaction =
+                serde_json::from_value(raw).map_err(|e| format!("bad tx: {}", e))?;
             Ok(crate::simulate::preflight(node, &tx))
         }
         // Batch status lookup: where each transaction is right now, in one call.

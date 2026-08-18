@@ -55,7 +55,12 @@ pub fn format_units(amount: u128, decimals: u8) -> String {
         return amount.to_string();
     }
     let scale = 10u128.pow(decimals as u32);
-    format!("{}.{:0width$}", amount / scale, amount % scale, width = decimals as usize)
+    format!(
+        "{}.{:0width$}",
+        amount / scale,
+        amount % scale,
+        width = decimals as usize
+    )
 }
 
 pub fn parse_units(s: &str, decimals: u8) -> Result<u128, String> {
@@ -72,17 +77,27 @@ pub fn parse_units(s: &str, decimals: u8) -> Result<u128, String> {
     while frac.len() < decimals as usize {
         frac.push('0');
     }
-    let frac: u128 = if frac.is_empty() { 0 } else { frac.parse().map_err(|_| "bad amount".to_string())? };
+    let frac: u128 = if frac.is_empty() {
+        0
+    } else {
+        frac.parse().map_err(|_| "bad amount".to_string())?
+    };
     Ok(whole * 10u128.pow(decimals as u32) + frac)
 }
 
 fn payload(p: &Option<Payload>) -> Result<&Payload, String> {
-    p.as_ref().ok_or_else(|| "token transaction missing payload".into())
+    p.as_ref()
+        .ok_or_else(|| "token transaction missing payload".into())
 }
 
 // ---- validation used by the mempool (no state writes) ----
 
-pub fn check_create(store: &Store, sender: &str, nonce: u64, p: &Option<Payload>) -> Result<(), String> {
+pub fn check_create(
+    store: &Store,
+    sender: &str,
+    nonce: u64,
+    p: &Option<Payload>,
+) -> Result<(), String> {
     let p = payload(p)?;
     let symbol = normalize_symbol(&p.symbol)?;
     if p.name.trim().is_empty() || p.name.len() > MAX_NAME_LEN {
@@ -97,7 +112,13 @@ pub fn check_create(store: &Store, sender: &str, nonce: u64, p: &Option<Payload>
     Ok(())
 }
 
-pub fn check_mint(store: &Store, sender: &str, to: &str, amount: u128, p: &Option<Payload>) -> Result<(), String> {
+pub fn check_mint(
+    store: &Store,
+    sender: &str,
+    to: &str,
+    amount: u128,
+    p: &Option<Payload>,
+) -> Result<(), String> {
     let p = payload(p)?;
     let token = store.token(&p.token).ok_or("unknown token")?;
     if token.creator != sender {
@@ -115,7 +136,13 @@ pub fn check_mint(store: &Store, sender: &str, to: &str, amount: u128, p: &Optio
     Ok(())
 }
 
-pub fn check_token_transfer(store: &Store, sender: &str, to: &str, amount: u128, p: &Option<Payload>) -> Result<(), String> {
+pub fn check_token_transfer(
+    store: &Store,
+    sender: &str,
+    to: &str,
+    amount: u128,
+    p: &Option<Payload>,
+) -> Result<(), String> {
     let p = payload(p)?;
     let token = store.token(&p.token).ok_or("unknown token")?;
     if amount == 0 {
@@ -130,7 +157,12 @@ pub fn check_token_transfer(store: &Store, sender: &str, to: &str, amount: u128,
     Ok(())
 }
 
-pub fn check_burn(store: &Store, sender: &str, amount: u128, p: &Option<Payload>) -> Result<(), String> {
+pub fn check_burn(
+    store: &Store,
+    sender: &str,
+    amount: u128,
+    p: &Option<Payload>,
+) -> Result<(), String> {
     let p = payload(p)?;
     let token = store.token(&p.token).ok_or("unknown token")?;
     if amount == 0 {
@@ -176,33 +208,50 @@ pub fn apply_create(
     };
     store.set_token(&token);
     if initial_supply > 0 {
-        store.credit_token(&id, sender, initial_supply);
+        store.credit_token(&id, sender, initial_supply)?;
     }
     Ok(id)
 }
 
-pub fn apply_mint(store: &Store, sender: &str, to: &str, amount: u128, p: &Option<Payload>) -> Result<(), String> {
+pub fn apply_mint(
+    store: &Store,
+    sender: &str,
+    to: &str,
+    amount: u128,
+    p: &Option<Payload>,
+) -> Result<(), String> {
     let p = payload(p)?;
     let token = store.token(&p.token).ok_or("unknown token")?;
     if token.creator != sender || !token.mintable {
         return Err("not allowed to mint this token".into());
     }
-    store.credit_token(&token.id, to, amount);
+    store.credit_token(&token.id, to, amount)?;
     Ok(())
 }
 
-pub fn apply_token_transfer(store: &Store, sender: &str, to: &str, amount: u128, p: &Option<Payload>) -> Result<(), String> {
+pub fn apply_token_transfer(
+    store: &Store,
+    sender: &str,
+    to: &str,
+    amount: u128,
+    p: &Option<Payload>,
+) -> Result<(), String> {
     let p = payload(p)?;
     let token = store.token(&p.token).ok_or("unknown token")?;
     if sender == to {
         return Ok(());
     }
     store.debit_token(&token.id, sender, amount)?;
-    store.credit_token(&token.id, to, amount);
+    store.credit_token(&token.id, to, amount)?;
     Ok(())
 }
 
-pub fn apply_burn(store: &Store, sender: &str, amount: u128, p: &Option<Payload>) -> Result<(), String> {
+pub fn apply_burn(
+    store: &Store,
+    sender: &str,
+    amount: u128,
+    p: &Option<Payload>,
+) -> Result<(), String> {
     let p = payload(p)?;
     let token = store.token(&p.token).ok_or("unknown token")?;
     store.debit_token(&token.id, sender, amount)?;

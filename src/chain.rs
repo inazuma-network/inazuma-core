@@ -1,17 +1,18 @@
 //! Inazuma consensus + execution: mempool, transaction application, block production.
 
-use crate::crypto::{is_valid_address, Keypair};
 use crate::consensus::VoteTracker;
 use crate::contracts::{self, DEPLOY_FEE};
+use crate::crypto::{is_valid_address, Keypair};
 use crate::events::{Event, EventBus};
 use crate::fees::{self, FEE_MARKET_ACTIVATION_HEIGHT};
 use crate::mempool::{Mempool, MAX_PENDING_PER_SENDER};
-use crate::state::Store;
-use crate::staking::{self, Validator};
 use crate::slashing::{self, Evidence};
+use crate::staking::{self, Validator};
+use crate::state::Store;
 use crate::tokens::{self, TOKEN_CREATION_FEE};
 use crate::types::{
-    txs_root, Block, Genesis, Transaction, TxKind, Unbond, MIN_FEE, MIN_STAKE, UNBONDING_BLOCKS,
+    best_peer_height, txs_root, Block, Genesis, Transaction, TxKind, Unbond, MIN_FEE, MIN_STAKE,
+    PRODUCE_LAG_TOLERANCE, UNBONDING_BLOCKS,
 };
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -23,7 +24,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const VERIFY_PARALLEL_THRESHOLD: usize = 64;
 
 pub fn verify_threads() -> usize {
-    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).clamp(1, 16)
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2)
+        .clamp(1, 16)
 }
 
 pub const MAX_TXS_PER_BLOCK: usize = 5_000;
@@ -34,18 +38,60 @@ pub const MAX_TXS_PER_BLOCK: usize = 5_000;
 pub const MAX_LEADER_ATTEMPTS: u64 = 4096;
 /// Extra attempts tolerated on import to absorb clock and network jitter.
 pub const LEADER_ATTEMPT_SLACK: u64 = 2;
+/// How far into the future a block header's timestamp may point before the
+/// block is rejected outright. Without this bound a bonded validator could
+/// stamp the far future, claim every rotation attempt from now until then, and
+/// legally seal an unbounded run of blocks — full censorship of the chain.
+pub const MAX_TIMESTAMP_DRIFT_MS: u128 = 12_000;
+/// Timestamps must strictly increase, so a producer can neither replay a
+/// parent's slot window nor drag the chain clock backwards.
+pub const MIN_TIMESTAMP_SPACING_MS: u128 = 1;
 
 pub fn now_ms() -> u128 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u128
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u128
+}
+
+/// Consensus rule for header time. Pure so it can be tested directly.
+/// A header timestamp is only trusted inside a window: strictly after its
+/// parent, and no further ahead than one clock-drift allowance.
+pub fn check_timestamp(parent_ts: u128, ts: u128, now: u128) -> Result<(), String> {
+    if ts < parent_ts.saturating_add(MIN_TIMESTAMP_SPACING_MS) {
+        return Err(format!(
+            "timestamp not increasing: parent {} block {}",
+            parent_ts, ts
+        ));
+    }
+    if ts > now.saturating_add(MAX_TIMESTAMP_DRIFT_MS) {
+        return Err(format!(
+            "timestamp too far in the future ({} > now + {}ms)",
+            ts, MAX_TIMESTAMP_DRIFT_MS
+        ));
+    }
+    Ok(())
+}
+
+/// Rotation attempts a header may legitimately claim. The producer's own
+/// timestamp can only ever shrink this window, never widen it past what this
+/// node's clock says has really elapsed.
+pub fn leader_attempt_window(parent_ts: u128, ts: u128, now: u128, slot_ms: u64) -> u64 {
+    let slot = slot_ms.max(1);
+    let claimed = ts.saturating_sub(parent_ts);
+    // No drift bonus here: the window follows time that has actually passed on
+    // this node's clock, so a producer stamping the future cannot mine extra
+    // rotation attempts. LEADER_ATTEMPT_SLACK already covers honest clock skew.
+    let real = now.saturating_sub(parent_ts);
+    ((claimed.min(real) as u64) / slot)
+        .saturating_add(LEADER_ATTEMPT_SLACK)
+        .min(MAX_LEADER_ATTEMPTS)
 }
 
 /// Stateless part of admission: cheap rejects first, then the one expensive
 /// signature check, then sender recovery and hashing. No locks are involved, so
 /// this can run on any thread while the node keeps producing blocks.
-fn precheck_tx(
-    tx: Transaction,
-    chain_id: u64,
-) -> Result<(Transaction, String, String), String> {
+fn precheck_tx(tx: Transaction, chain_id: u64) -> Result<(Transaction, String, String), String> {
     if tx.chain_id != chain_id {
         return Err("wrong chain id".into());
     }
@@ -138,6 +184,28 @@ impl Node {
 
     pub fn set_serving_only(&self, on: bool) {
         self.serving_only.store(on, Ordering::Relaxed);
+    }
+
+    /// True when this node is under an emergency halt.
+    pub fn halted(&self) -> bool {
+        self.store.halt_reason().is_some()
+    }
+
+    /// Freeze the node: no sealing, no voting, no admission, no import.
+    pub fn halt(&self, reason: &str) {
+        let reason = if reason.trim().is_empty() {
+            "operator halt"
+        } else {
+            reason.trim()
+        };
+        self.store.set_halt(reason);
+        eprintln!("[halt] node frozen: {}", reason);
+    }
+
+    /// Lift the halt and resume consensus.
+    pub fn resume(&self) {
+        self.store.clear_halt();
+        eprintln!("[halt] node resumed");
     }
 
     pub fn serving_only(&self) -> bool {
@@ -259,6 +327,12 @@ impl Node {
         if txs.is_empty() {
             return Vec::new();
         }
+        if let Some(reason) = self.store.halt_reason() {
+            return txs
+                .into_iter()
+                .map(|_| Err(format!("node halted: {}", reason)))
+                .collect();
+        }
         let mut prepared = self.precheck_batch(txs);
 
         let _exec = self.exec_lock.lock().unwrap();
@@ -281,13 +355,13 @@ impl Node {
     ) -> Vec<Result<(Transaction, String, String), String>> {
         let chain_id = self.genesis.chain_id;
         if txs.len() < VERIFY_PARALLEL_THRESHOLD {
-            return txs.into_iter().map(|tx| precheck_tx(tx, chain_id)).collect();
+            return txs
+                .into_iter()
+                .map(|tx| precheck_tx(tx, chain_id))
+                .collect();
         }
         let chunk = txs.len().div_ceil(verify_threads());
-        let chunks: Vec<Vec<Transaction>> = txs
-            .chunks(chunk)
-            .map(|c| c.to_vec())
-            .collect();
+        let chunks: Vec<Vec<Transaction>> = txs.chunks(chunk).map(|c| c.to_vec()).collect();
         std::thread::scope(|scope| {
             let handles: Vec<_> = chunks
                 .into_iter()
@@ -430,8 +504,12 @@ impl Node {
         // Token rules are re-checked against live state before anything is
         // written, so a failed token tx can never leave a partial state change.
         match tx.kind {
-            TxKind::CreateToken => tokens::check_create(&self.store, &sender, tx.nonce, &tx.payload)?,
-            TxKind::MintToken => tokens::check_mint(&self.store, &sender, &tx.to, tx.amount, &tx.payload)?,
+            TxKind::CreateToken => {
+                tokens::check_create(&self.store, &sender, tx.nonce, &tx.payload)?
+            }
+            TxKind::MintToken => {
+                tokens::check_mint(&self.store, &sender, &tx.to, tx.amount, &tx.payload)?
+            }
             TxKind::TokenTransfer => {
                 tokens::check_token_transfer(&self.store, &sender, &tx.to, tx.amount, &tx.payload)?
             }
@@ -503,7 +581,14 @@ impl Node {
             }
             TxKind::CreateToken => {
                 self.store.set_account(&sender, &from);
-                tokens::apply_create(&self.store, &sender, tx.nonce, tx.amount, height, &tx.payload)?;
+                tokens::apply_create(
+                    &self.store,
+                    &sender,
+                    tx.nonce,
+                    tx.amount,
+                    height,
+                    &tx.payload,
+                )?;
             }
             TxKind::MintToken => {
                 self.store.set_account(&sender, &from);
@@ -545,7 +630,10 @@ impl Node {
             TxKind::CallContract => {
                 self.store.set_account(&sender, &from);
                 let c = contracts::check_call(&self.store, &tx.to)?;
-                let code = self.store.code(&c.code_hash).ok_or("contract code missing")?;
+                let code = self
+                    .store
+                    .code(&c.code_hash)
+                    .ok_or("contract code missing")?;
                 let input = contracts::decode_args(&tx.payload)?;
                 // Attached value lands on the contract before it runs, so the
                 // contract can spend or refund it during the call.
@@ -586,7 +674,8 @@ impl Node {
                     );
                 } else {
                     for (key, value) in &outcome.writes {
-                        self.store.set_contract_storage(&tx.to, key, value.as_deref());
+                        self.store
+                            .set_contract_storage(&tx.to, key, value.as_deref());
                     }
                     for (to, amount) in &outcome.transfers {
                         let mut cacct = self.store.account(&tx.to);
@@ -639,10 +728,26 @@ impl Node {
         if self.serving_only() {
             return Ok(None);
         }
+        // Emergency halt: stop extending the chain but keep serving reads, so
+        // operators can inspect state and coordinate a fix. Halting is a local
+        // operator action; a coordinated halt is every validator halting, which
+        // stalls finality without anyone producing a divergent branch.
+        if self.halted() {
+            return Ok(None);
+        }
         let _exec = self.exec_lock.lock().unwrap();
         let parent_height = self.store.tip_height().ok_or("chain not initialized")?;
         let parent_hash = self.store.tip_hash();
         let height = parent_height + 1;
+
+        // Never seal on a stale tip. A validator that is behind the network and
+        // still produces builds a private branch off an old parent; every peer
+        // rejects it as a parent-hash mismatch, and repairing it costs a full
+        // replay that a small box can never win against a live chain. Catching
+        // up first costs at most a few missed slots.
+        if !self.solo() && best_peer_height() > parent_height + PRODUCE_LAG_TOLERANCE {
+            return Ok(None);
+        }
 
         let set = staking::validator_set(&self.store);
         let attempt = self.current_attempt();
@@ -663,15 +768,27 @@ impl Node {
             pool.take_batch(MAX_TXS_PER_BLOCK)
         };
 
+        // The whole block is journaled, and so is every transaction inside it.
+        // A transaction that fails halfway through its writes is rolled back on
+        // its own; without that its partial writes would stay in state while the
+        // transaction itself is dropped from the block, so the state root this
+        // producer signs covers changes no importer can reproduce and every peer
+        // rejects the block as a state-root mismatch — permanently.
+        self.store.begin_block();
         let mut included: Vec<Transaction> = Vec::with_capacity(batch.len());
         let mut fees: u128 = 0;
         for tx in batch {
+            self.store.begin_tx();
             match self.apply_tx(&tx, height) {
                 Ok(fee) => {
+                    self.store.commit_tx();
                     fees += fee;
                     included.push(tx);
                 }
-                Err(_) => { /* invalid at execution time: dropped */ }
+                Err(_) => {
+                    // Invalid at execution time: undo it and drop it.
+                    self.store.abort_tx();
+                }
             }
         }
 
@@ -696,8 +813,11 @@ impl Node {
         block.signature = self.producer.sign_hex(&block.header_bytes());
         block.hash = block.compute_hash();
         self.store.put_block(&block);
-        self.store
-            .set_base_fee(fees::next_base_fee(self.store.base_fee(), block.transactions.len()));
+        self.store.set_base_fee(fees::next_base_fee(
+            self.store.base_fee(),
+            block.transactions.len(),
+        ));
+        self.store.commit_block();
         self.store.flush_stakers();
         self.store.flush_state_tree();
         self.store.flush_tokens();
@@ -713,7 +833,24 @@ impl Node {
     /// Validate and apply a block received from a peer. `Ok(false)` means the
     /// block is one we already have; `Err` means it was rejected.
     pub fn import_block(&self, block: &Block) -> Result<bool, String> {
+        if let Some(reason) = self.store.halt_reason() {
+            return Err(format!("node halted: {}", reason));
+        }
         let _exec = self.exec_lock.lock().unwrap();
+        // Execution writes straight to the store, so a block that fails a later
+        // check (state root, invalid tx) must be undone. Without this a single
+        // rejected block leaves half-applied changes behind, every retry
+        // computes a different state root, and the node forks permanently.
+        self.store.begin_block();
+        let outcome = self.import_block_inner(block);
+        match &outcome {
+            Ok(_) => self.store.commit_block(),
+            Err(_) => self.store.abort_block(),
+        }
+        outcome
+    }
+
+    fn import_block_inner(&self, block: &Block) -> Result<bool, String> {
         let tip = self.store.tip_height().ok_or("chain not initialized")?;
         if block.height <= tip {
             return Ok(false);
@@ -734,18 +871,26 @@ impl Node {
             return Err("txs root mismatch".into());
         }
 
+        // Header time is bounded before it is used for anything. It is a
+        // producer-supplied field, so it is only trusted inside a window: it
+        // must strictly follow the parent, and it may not point further into
+        // the future than one clock-drift allowance.
+        let parent = self.store.block(tip);
+        let parent_ts = parent.as_ref().map(|b| b.timestamp_ms).unwrap_or(0);
+        check_timestamp(parent_ts, block.timestamp_ms, now_ms())?;
+
         // The producer must be a leader this height could legitimately elect.
-        // The attempt window comes from the block's own timestamp versus its
-        // parent's, so replaying old history is judged the same way the network
-        // judged it live — never against the importer's wall clock.
+        // The attempt window is the elapsed time since the parent, but capped by
+        // how much time has really passed on this node's clock — a producer
+        // cannot buy extra rotation attempts by inflating its own header.
         let set = staking::validator_set(&self.store);
         if !set.is_empty() {
-            let parent_ts = self.store.block(tip).map(|b| b.timestamp_ms).unwrap_or(0);
-            let slot = self.genesis.block_time_ms.max(1);
-            let elapsed = block.timestamp_ms.saturating_sub(parent_ts) as u64;
-            let max_attempt = (elapsed / slot)
-                .saturating_add(LEADER_ATTEMPT_SLACK)
-                .min(MAX_LEADER_ATTEMPTS);
+            let max_attempt = leader_attempt_window(
+                parent_ts,
+                block.timestamp_ms,
+                now_ms(),
+                self.genesis.block_time_ms,
+            );
             let allowed = (0..=max_attempt).any(|a| {
                 staking::elect_leader_attempt(&set, block.height, &block.parent_hash, a).as_deref()
                     == Some(block.producer.as_str())
@@ -798,8 +943,10 @@ impl Node {
         let mut stored = block.clone();
         stored.hash = block.hash.clone();
         self.store.put_block(&stored);
-        self.store
-            .set_base_fee(fees::next_base_fee(self.store.base_fee(), block.transactions.len()));
+        self.store.set_base_fee(fees::next_base_fee(
+            self.store.base_fee(),
+            block.transactions.len(),
+        ));
         self.store.flush_stakers();
         self.store.flush_state_tree();
         self.store.flush_tokens();
@@ -886,7 +1033,10 @@ impl Node {
                 let contract = if matches!(tx.kind, TxKind::CallContract) {
                     tx.to.clone()
                 } else {
-                    self.store.receipt(&hash).map(|r| r.contract).unwrap_or_default()
+                    self.store
+                        .receipt(&hash)
+                        .map(|r| r.contract)
+                        .unwrap_or_default()
                 };
                 self.events.publish(Event::new(
                     "logs",
@@ -971,7 +1121,12 @@ impl Node {
         tx.signature = self.producer.sign_hex(&tx.signing_bytes());
         let hash = self.accept_tx(tx.clone())?;
         self.gossip_tx(&tx);
-        println!("[slash] reported {} at #{} -> {}", evidence.label(), evidence.height(), &hash[..8]);
+        println!(
+            "[slash] reported {} at #{} -> {}",
+            evidence.label(),
+            evidence.height(),
+            &hash[..8]
+        );
         Ok(hash)
     }
 
@@ -991,5 +1146,44 @@ impl Node {
             b: slashing::HeaderProof::from_block(incoming),
         };
         evidence.verify().ok().map(|_| evidence)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NOW: u128 = 1_800_000_000_000;
+
+    #[test]
+    fn timestamp_must_increase() {
+        assert!(check_timestamp(NOW - 400, NOW - 400, NOW).is_err());
+        assert!(check_timestamp(NOW - 400, NOW - 900, NOW).is_err());
+        assert!(check_timestamp(NOW - 400, NOW - 399, NOW).is_ok());
+    }
+
+    #[test]
+    fn future_timestamp_rejected() {
+        assert!(check_timestamp(NOW - 400, NOW + MAX_TIMESTAMP_DRIFT_MS + 1, NOW).is_err());
+        // A whole day in the future is the leader-schedule bypass: must not pass.
+        assert!(check_timestamp(NOW - 400, NOW + 86_400_000, NOW).is_err());
+        // Modest drift is tolerated so honest clocks still work.
+        assert!(check_timestamp(NOW - 400, NOW + 1_000, NOW).is_ok());
+    }
+
+    #[test]
+    fn leader_window_cannot_be_inflated_by_the_producer() {
+        let parent = NOW - 400;
+        let honest = leader_attempt_window(parent, NOW, NOW, 400);
+        // Claiming a far-future timestamp must not buy extra rotation attempts.
+        let greedy = leader_attempt_window(parent, NOW + 86_400_000, NOW, 400);
+        assert_eq!(honest, greedy);
+        assert!(greedy < 10, "window {} is inflated", greedy);
+        // Replaying real history still gets a window that grows with the real
+        // gap between parent and block, and stays bounded.
+        let short = leader_attempt_window(0, 10_000, NOW, 400);
+        let long = leader_attempt_window(0, 40_000, NOW, 400);
+        assert!(long > short);
+        assert!(long <= MAX_LEADER_ATTEMPTS);
     }
 }

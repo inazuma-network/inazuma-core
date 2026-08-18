@@ -51,7 +51,9 @@ pub fn serve(node: Arc<Node>, addr: &str, cfg: Arc<RpcConfig>) -> Result<(), Str
                 let cg = Arc::clone(&conns);
                 let ipc = Arc::clone(&per_ip);
                 std::thread::spawn(move || {
-                    let Some(_ticket) = cg.try_acquire() else { return };
+                    let Some(_ticket) = cg.try_acquire() else {
+                        return;
+                    };
                     let ip = s.peer_addr().map(|p| p.ip()).ok();
                     let _ip_ticket = match ip {
                         Some(ip) => match ipc.try_acquire(ip) {
@@ -94,12 +96,20 @@ fn handle(
     let request_line = lines.next().unwrap_or("").to_string();
     for line in lines {
         let lower = line.to_ascii_lowercase();
-        let raw = || line[line.find(':').map(|i| i + 1).unwrap_or(0)..].trim().to_string();
+        let raw = || {
+            line[line.find(':').map(|i| i + 1).unwrap_or(0)..]
+                .trim()
+                .to_string()
+        };
         if lower.starts_with("sec-websocket-key:") {
             key = Some(raw());
         } else if lower.starts_with("authorization:") {
             let v = raw();
-            let t = v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")).unwrap_or(&v).to_string();
+            let t = v
+                .strip_prefix("Bearer ")
+                .or_else(|| v.strip_prefix("bearer "))
+                .unwrap_or(&v)
+                .to_string();
             if !t.is_empty() {
                 credential = Some(t);
             }
@@ -114,11 +124,18 @@ fn handle(
     }
     // Browsers cannot set headers on a WebSocket, so a key may also arrive in the
     // query string. Same credential, same tier, same limits.
-    let path = request_line.split_whitespace().nth(1).unwrap_or("/").to_string();
+    let path = request_line
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or("/")
+        .to_string();
     if credential.is_none() {
         if let Some(q) = path.split_once('?').map(|(_, q)| q) {
             for part in q.split('&') {
-                if let Some(v) = part.strip_prefix("key=").or_else(|| part.strip_prefix("apikey=")) {
+                if let Some(v) = part
+                    .strip_prefix("key=")
+                    .or_else(|| part.strip_prefix("apikey="))
+                {
                     if !v.is_empty() {
                         credential = Some(v.to_string());
                     }
@@ -136,14 +153,18 @@ fn handle(
         let _ = stream.write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n");
         return Err("api key required".into());
     }
-    let client_ip = forwarded.or(peer_ip).unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    let client_ip = forwarded
+        .or(peer_ip)
+        .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
 
     let accept = b64(&sha1(format!("{}{}", key.trim(), WS_GUID).as_bytes()));
     let resp = format!(
         "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n",
         accept
     );
-    stream.write_all(resp.as_bytes()).map_err(|e| e.to_string())?;
+    stream
+        .write_all(resp.as_bytes())
+        .map_err(|e| e.to_string())?;
     stream.flush().ok();
 
     // ---- connection state ----
@@ -171,7 +192,10 @@ fn handle(
             }
         }
         pump_stop.store(true, Ordering::Relaxed);
-        let _ = pump_writer.lock().unwrap().shutdown(std::net::Shutdown::Both);
+        let _ = pump_writer
+            .lock()
+            .unwrap()
+            .shutdown(std::net::Shutdown::Both);
     });
 
     let mut last_seen = Instant::now();
@@ -181,10 +205,14 @@ fn handle(
             break Ok(());
         }
         match read_frame(&mut stream) {
-            Ok(Some(Frame { opcode, payload, fin })) => {
+            Ok(Some(Frame {
+                opcode,
+                payload,
+                fin,
+            })) => {
                 last_seen = Instant::now();
                 match opcode {
-                    0x8 => break Ok(()),                 // close
+                    0x8 => break Ok(()), // close
                     0x9 => {
                         let _ = send(&writer, 0xA, &payload); // ping -> pong
                         continue;
@@ -201,7 +229,13 @@ fn handle(
                         }
                         let text = std::mem::take(&mut fragment);
                         let out = handle_message(
-                            &node, &text, &cfg, tier, credential.as_deref(), client_ip, conn,
+                            &node,
+                            &text,
+                            &cfg,
+                            tier,
+                            credential.as_deref(),
+                            client_ip,
+                            conn,
                             &sub_sender,
                         );
                         if let Some(reply) = out {
@@ -249,7 +283,11 @@ fn handle_message(
         }
     };
     let id = req.get("id").cloned().unwrap_or(Value::Null);
-    let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("").to_string();
+    let method = req
+        .get("method")
+        .and_then(|m| m.as_str())
+        .unwrap_or("")
+        .to_string();
     let params = req.get("params").cloned().unwrap_or(json!({}));
 
     let cost = rpcauth::method_cost(&method, &params);
@@ -259,10 +297,9 @@ fn handle_message(
                 .to_string(),
         );
     }
-    if rpcauth::PRIVILEGED_METHODS.contains(&method.as_str())
-        && cfg.auth_enabled()
-        && tier != Tier::Admin
-    {
+    // Fail closed, exactly like the HTTP path: no admin key configured means the
+    // operator-only methods are unavailable, not public.
+    if rpcauth::PRIVILEGED_METHODS.contains(&method.as_str()) && tier != Tier::Admin {
         return Some(
             json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32002, "message": "admin key required" } })
                 .to_string(),
@@ -293,7 +330,10 @@ fn handle_message(
 
     Some(match result {
         Ok(value) => json!({ "jsonrpc": "2.0", "id": id, "result": value }).to_string(),
-        Err(msg) => json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32000, "message": msg } }).to_string(),
+        Err(msg) => {
+            json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32000, "message": msg } })
+                .to_string()
+        }
     })
 }
 
@@ -325,7 +365,9 @@ fn read_exact(stream: &mut TcpStream, n: usize) -> Result<Option<Vec<u8>>, Strin
 }
 
 fn read_frame(stream: &mut TcpStream) -> Result<Option<Frame>, String> {
-    let Some(head) = read_exact(stream, 2)? else { return Ok(None) };
+    let Some(head) = read_exact(stream, 2)? else {
+        return Ok(None);
+    };
     let fin = head[0] & 0x80 != 0;
     let opcode = head[0] & 0x0F;
     let masked = head[1] & 0x80 != 0;
@@ -360,7 +402,11 @@ fn read_frame(stream: &mut TcpStream) -> Result<Option<Frame>, String> {
     for (i, b) in payload.iter_mut().enumerate() {
         *b ^= mask[i % 4];
     }
-    Ok(Some(Frame { opcode, payload, fin }))
+    Ok(Some(Frame {
+        opcode,
+        payload,
+        fin,
+    }))
 }
 
 fn send(stream: &Arc<Mutex<TcpStream>>, opcode: u8, payload: &[u8]) -> Result<(), String> {
@@ -419,7 +465,12 @@ fn sha1(data: &[u8]) -> [u8; 20] {
     for block in msg.chunks(64) {
         let mut w = [0u32; 80];
         for i in 0..16 {
-            w[i] = u32::from_be_bytes([block[i * 4], block[i * 4 + 1], block[i * 4 + 2], block[i * 4 + 3]]);
+            w[i] = u32::from_be_bytes([
+                block[i * 4],
+                block[i * 4 + 1],
+                block[i * 4 + 2],
+                block[i * 4 + 3],
+            ]);
         }
         for i in 16..80 {
             w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
@@ -461,12 +512,24 @@ fn b64(data: &[u8]) -> String {
     const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::new();
     for chunk in data.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
         out.push(T[(n >> 18) as usize & 63] as char);
         out.push(T[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if chunk.len() > 2 { T[n as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            T[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[n as usize & 63] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -478,7 +541,9 @@ mod tests {
     #[test]
     fn handshake_accept_matches_the_spec_example() {
         // RFC 6455 section 1.3 worked example.
-        let accept = b64(&sha1(format!("{}{}", "dGhlIHNhbXBsZSBub25jZQ==", WS_GUID).as_bytes()));
+        let accept = b64(&sha1(
+            format!("{}{}", "dGhlIHNhbXBsZSBub25jZQ==", WS_GUID).as_bytes(),
+        ));
         assert_eq!(accept, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
     }
 

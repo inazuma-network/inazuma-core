@@ -79,7 +79,8 @@ pub fn code_hash(code: &[u8]) -> String {
 }
 
 fn payload<'a>(p: &'a Option<Payload>) -> Result<&'a Payload, String> {
-    p.as_ref().ok_or_else(|| "missing contract payload".to_string())
+    p.as_ref()
+        .ok_or_else(|| "missing contract payload".to_string())
 }
 
 pub fn decode_code(p: &Option<Payload>) -> Result<Vec<u8>, String> {
@@ -131,7 +132,9 @@ pub fn check_call(store: &Store, address: &str) -> Result<Contract, String> {
     if !is_valid_address(address) {
         return Err("invalid contract address".into());
     }
-    store.contract(address).ok_or_else(|| "no contract at address".to_string())
+    store
+        .contract(address)
+        .ok_or_else(|| "no contract at address".to_string())
 }
 
 // ---------------- execution ----------------
@@ -298,12 +301,18 @@ pub fn execute(
         return Outcome::failed(format!("host link failed: {}", e), 0);
     }
 
-    let instance = match linker.instantiate(&mut wstore, &module).and_then(|i| i.start(&mut wstore)) {
+    let instance = match linker
+        .instantiate(&mut wstore, &module)
+        .and_then(|i| i.start(&mut wstore))
+    {
         Ok(i) => i,
         Err(e) => {
             let used = fuel.saturating_sub(wstore.fuel_consumed().unwrap_or(0));
             let _ = used;
-            return Outcome::failed(format!("instantiate failed: {}", e), wstore.fuel_consumed().unwrap_or(0));
+            return Outcome::failed(
+                format!("instantiate failed: {}", e),
+                wstore.fuel_consumed().unwrap_or(0),
+            );
         }
     };
     let invoke = match instance.get_typed_func::<(), i32>(&wstore, "invoke") {
@@ -324,7 +333,15 @@ pub fn execute(
         .collect();
 
     match result {
-        Ok(0) => Outcome { ok: true, ret, logs, fuel_used, error: None, writes, transfers },
+        Ok(0) => Outcome {
+            ok: true,
+            ret,
+            logs,
+            fuel_used,
+            error: None,
+            writes,
+            transfers,
+        },
         Ok(code) => Outcome {
             ok: false,
             ret,
@@ -356,131 +373,166 @@ fn trap_message(e: &Trap) -> String {
 }
 
 fn link_host(linker: &mut Linker<Host<'_>>) -> Result<(), String> {
-    linker.func_wrap("env", "inz_input_len", |caller: Caller<'_, Host>| -> i32 {
-        caller.data().input.len() as i32
-    }).map_err(|e| e.to_string())?;
-    linker.func_wrap(
-        "env",
-        "inz_input",
-        |mut caller: Caller<'_, Host>, ptr: i32, cap: i32| -> Result<i32, Trap> {
-            let data = caller.data().input.clone();
-            write_out(&mut caller, ptr, cap, &data)
-        },
-    ).map_err(|e| e.to_string())?;
-    linker.func_wrap(
-        "env",
-        "inz_return",
-        |mut caller: Caller<'_, Host>, ptr: i32, len: i32| -> Result<(), Trap> {
-            let data = read_bytes(&mut caller, ptr, len, MAX_RETURN_BYTES)?;
-            caller.data_mut().ret = data;
-            Ok(())
-        },
-    ).map_err(|e| e.to_string())?;
-    linker.func_wrap(
-        "env",
-        "inz_log",
-        |mut caller: Caller<'_, Host>, ptr: i32, len: i32| -> Result<(), Trap> {
-            let data = read_bytes(&mut caller, ptr, len, 1024)?;
-            let host = caller.data_mut();
-            if host.logs.len() < MAX_LOGS {
-                host.logs.push(String::from_utf8_lossy(&data).to_string());
-            }
-            Ok(())
-        },
-    ).map_err(|e| e.to_string())?;
-    linker.func_wrap(
-        "env",
-        "inz_caller",
-        |mut caller: Caller<'_, Host>, ptr: i32, cap: i32| -> Result<i32, Trap> {
-            let v = caller.data().caller.clone();
-            write_out(&mut caller, ptr, cap, v.as_bytes())
-        },
-    ).map_err(|e| e.to_string())?;
-    linker.func_wrap(
-        "env",
-        "inz_self",
-        |mut caller: Caller<'_, Host>, ptr: i32, cap: i32| -> Result<i32, Trap> {
-            let v = caller.data().contract.clone();
-            write_out(&mut caller, ptr, cap, v.as_bytes())
-        },
-    ).map_err(|e| e.to_string())?;
-    linker.func_wrap("env", "inz_value", |caller: Caller<'_, Host>| -> i64 {
-        caller.data().value.min(i64::MAX as u128) as i64
-    }).map_err(|e| e.to_string())?;
-    linker.func_wrap("env", "inz_height", |caller: Caller<'_, Host>| -> i64 {
-        caller.data().height as i64
-    }).map_err(|e| e.to_string())?;
-    linker.func_wrap(
-        "env",
-        "inz_balance",
-        |caller: Caller<'_, Host>| -> i64 {
+    linker
+        .func_wrap("env", "inz_input_len", |caller: Caller<'_, Host>| -> i32 {
+            caller.data().input.len() as i32
+        })
+        .map_err(|e| e.to_string())?;
+    linker
+        .func_wrap(
+            "env",
+            "inz_input",
+            |mut caller: Caller<'_, Host>, ptr: i32, cap: i32| -> Result<i32, Trap> {
+                let data = caller.data().input.clone();
+                write_out(&mut caller, ptr, cap, &data)
+            },
+        )
+        .map_err(|e| e.to_string())?;
+    linker
+        .func_wrap(
+            "env",
+            "inz_return",
+            |mut caller: Caller<'_, Host>, ptr: i32, len: i32| -> Result<(), Trap> {
+                let data = read_bytes(&mut caller, ptr, len, MAX_RETURN_BYTES)?;
+                caller.data_mut().ret = data;
+                Ok(())
+            },
+        )
+        .map_err(|e| e.to_string())?;
+    linker
+        .func_wrap(
+            "env",
+            "inz_log",
+            |mut caller: Caller<'_, Host>, ptr: i32, len: i32| -> Result<(), Trap> {
+                let data = read_bytes(&mut caller, ptr, len, 1024)?;
+                let host = caller.data_mut();
+                if host.logs.len() < MAX_LOGS {
+                    host.logs.push(String::from_utf8_lossy(&data).to_string());
+                }
+                Ok(())
+            },
+        )
+        .map_err(|e| e.to_string())?;
+    linker
+        .func_wrap(
+            "env",
+            "inz_caller",
+            |mut caller: Caller<'_, Host>, ptr: i32, cap: i32| -> Result<i32, Trap> {
+                let v = caller.data().caller.clone();
+                write_out(&mut caller, ptr, cap, v.as_bytes())
+            },
+        )
+        .map_err(|e| e.to_string())?;
+    linker
+        .func_wrap(
+            "env",
+            "inz_self",
+            |mut caller: Caller<'_, Host>, ptr: i32, cap: i32| -> Result<i32, Trap> {
+                let v = caller.data().contract.clone();
+                write_out(&mut caller, ptr, cap, v.as_bytes())
+            },
+        )
+        .map_err(|e| e.to_string())?;
+    linker
+        .func_wrap("env", "inz_value", |caller: Caller<'_, Host>| -> i64 {
+            caller.data().value.min(i64::MAX as u128) as i64
+        })
+        .map_err(|e| e.to_string())?;
+    linker
+        .func_wrap("env", "inz_height", |caller: Caller<'_, Host>| -> i64 {
+            caller.data().height as i64
+        })
+        .map_err(|e| e.to_string())?;
+    linker
+        .func_wrap("env", "inz_balance", |caller: Caller<'_, Host>| -> i64 {
             let host = caller.data();
             let bal = host.store.account(&host.contract).balance;
             bal.min(i64::MAX as u128) as i64
-        },
-    ).map_err(|e| e.to_string())?;
-    linker.func_wrap(
-        "env",
-        "inz_read",
-        |mut caller: Caller<'_, Host>, kptr: i32, klen: i32, ptr: i32, cap: i32| -> Result<i32, Trap> {
-            let key = read_bytes(&mut caller, kptr, klen, MAX_KEY_BYTES)?;
-            let key = String::from_utf8_lossy(&key).to_string();
-            match caller.data().read_key(&key) {
-                None => Ok(-1),
-                Some(v) => write_out(&mut caller, ptr, cap, &v),
-            }
-        },
-    ).map_err(|e| e.to_string())?;
-    linker.func_wrap(
-        "env",
-        "inz_write",
-        |mut caller: Caller<'_, Host>, kptr: i32, klen: i32, vptr: i32, vlen: i32| -> Result<i32, Trap> {
-            let key = read_bytes(&mut caller, kptr, klen, MAX_KEY_BYTES)?;
-            let key = String::from_utf8_lossy(&key).to_string();
-            if key.is_empty() {
-                return Err(Trap::new("empty storage key"));
-            }
-            let value = if vlen == 0 {
-                Vec::new()
-            } else {
-                read_bytes(&mut caller, vptr, vlen, MAX_VALUE_BYTES)?
-            };
-            let host = caller.data_mut();
-            if !host.overlay.contains_key(&key) {
-                if host.order.len() >= MAX_WRITES {
-                    return Err(Trap::new("too many storage writes"));
+        })
+        .map_err(|e| e.to_string())?;
+    linker
+        .func_wrap(
+            "env",
+            "inz_read",
+            |mut caller: Caller<'_, Host>,
+             kptr: i32,
+             klen: i32,
+             ptr: i32,
+             cap: i32|
+             -> Result<i32, Trap> {
+                let key = read_bytes(&mut caller, kptr, klen, MAX_KEY_BYTES)?;
+                let key = String::from_utf8_lossy(&key).to_string();
+                match caller.data().read_key(&key) {
+                    None => Ok(-1),
+                    Some(v) => write_out(&mut caller, ptr, cap, &v),
                 }
-                host.order.push(key.clone());
-            }
-            // A zero-length write clears the key, keeping state compact.
-            host.overlay.insert(key, if value.is_empty() { None } else { Some(value) });
-            Ok(0)
-        },
-    ).map_err(|e| e.to_string())?;
-    linker.func_wrap(
-        "env",
-        "inz_transfer",
-        |mut caller: Caller<'_, Host>, aptr: i32, alen: i32, amount: i64| -> Result<i32, Trap> {
-            if amount < 0 {
-                return Err(Trap::new("negative amount"));
-            }
-            let addr = read_bytes(&mut caller, aptr, alen, 64)?;
-            let addr = String::from_utf8_lossy(&addr).to_string();
-            if !is_valid_address(&addr) {
-                return Ok(-1);
-            }
-            let amount = amount as u128;
-            let host = caller.data_mut();
-            if host.transfers.len() >= MAX_TRANSFERS {
-                return Err(Trap::new("too many transfers"));
-            }
-            if amount > host.spendable {
-                return Ok(-2);
-            }
-            host.spendable -= amount;
-            host.transfers.push((addr, amount));
-            Ok(0)
-        },
-    ).map_err(|e| e.to_string())?;
+            },
+        )
+        .map_err(|e| e.to_string())?;
+    linker
+        .func_wrap(
+            "env",
+            "inz_write",
+            |mut caller: Caller<'_, Host>,
+             kptr: i32,
+             klen: i32,
+             vptr: i32,
+             vlen: i32|
+             -> Result<i32, Trap> {
+                let key = read_bytes(&mut caller, kptr, klen, MAX_KEY_BYTES)?;
+                let key = String::from_utf8_lossy(&key).to_string();
+                if key.is_empty() {
+                    return Err(Trap::new("empty storage key"));
+                }
+                let value = if vlen == 0 {
+                    Vec::new()
+                } else {
+                    read_bytes(&mut caller, vptr, vlen, MAX_VALUE_BYTES)?
+                };
+                let host = caller.data_mut();
+                if !host.overlay.contains_key(&key) {
+                    if host.order.len() >= MAX_WRITES {
+                        return Err(Trap::new("too many storage writes"));
+                    }
+                    host.order.push(key.clone());
+                }
+                // A zero-length write clears the key, keeping state compact.
+                host.overlay
+                    .insert(key, if value.is_empty() { None } else { Some(value) });
+                Ok(0)
+            },
+        )
+        .map_err(|e| e.to_string())?;
+    linker
+        .func_wrap(
+            "env",
+            "inz_transfer",
+            |mut caller: Caller<'_, Host>,
+             aptr: i32,
+             alen: i32,
+             amount: i64|
+             -> Result<i32, Trap> {
+                if amount < 0 {
+                    return Err(Trap::new("negative amount"));
+                }
+                let addr = read_bytes(&mut caller, aptr, alen, 64)?;
+                let addr = String::from_utf8_lossy(&addr).to_string();
+                if !is_valid_address(&addr) {
+                    return Ok(-1);
+                }
+                let amount = amount as u128;
+                let host = caller.data_mut();
+                if host.transfers.len() >= MAX_TRANSFERS {
+                    return Err(Trap::new("too many transfers"));
+                }
+                if amount > host.spendable {
+                    return Ok(-2);
+                }
+                host.spendable -= amount;
+                host.transfers.push((addr, amount));
+                Ok(0)
+            },
+        )
+        .map_err(|e| e.to_string())?;
     Ok(())
 }

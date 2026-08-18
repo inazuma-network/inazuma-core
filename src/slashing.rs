@@ -110,7 +110,13 @@ impl Evidence {
             ),
         };
         hashes.sort();
-        format!("{}:{}:{}:{}", self.label(), self.height(), offender, hashes.join("+"))
+        format!(
+            "{}:{}:{}:{}",
+            self.label(),
+            self.height(),
+            offender,
+            hashes.join("+")
+        )
     }
 
     /// Check the proof stands on its own. Returns the offender's address.
@@ -200,7 +206,11 @@ pub fn equivocation_burn_pct(offender_stake: u128, total_stake: u128) -> u128 {
 }
 
 /// Read-only validation of a report before it enters the mempool or a block.
-pub fn check_report(store: &Store, height: u64, payload: &Option<Payload>) -> Result<Evidence, String> {
+pub fn check_report(
+    store: &Store,
+    height: u64,
+    payload: &Option<Payload>,
+) -> Result<Evidence, String> {
     let evidence = decode(payload)?;
     let offender = evidence.verify()?;
     if evidence.height() > height {
@@ -256,12 +266,19 @@ pub fn apply_report(
     acct.penalties.slashed += burned;
     store.set_account(&offender, &acct);
 
-    let bounty = burned * REPORTER_BOUNTY_PCT / 100;
+    // The bounty comes *out of* the confiscated stake, it is not newly issued.
+    // Paying it on top would mint INAZ on every slash, so a validator with two
+    // keys could equivocate on the smaller one and self-report to grow total
+    // supply. `burned` is therefore reported net of what the reporter received.
+    let mut bounty = burned * REPORTER_BOUNTY_PCT / 100;
     if bounty > 0 && reporter != offender {
         let mut r = store.account(reporter);
         r.balance += bounty;
         store.set_account(reporter, &r);
+    } else {
+        bounty = 0;
     }
+    let burned = burned - bounty;
 
     let record = SlashRecord {
         id: evidence.id(),
@@ -337,7 +354,9 @@ pub fn record_liveness(store: &Store, height: u64, parent_hash: &str, producer: 
 
     let mut missed: Vec<String> = Vec::new();
     for attempt in 0..used {
-        if let Some(leader) = crate::staking::elect_leader_attempt(&set, height, parent_hash, attempt) {
+        if let Some(leader) =
+            crate::staking::elect_leader_attempt(&set, height, parent_hash, attempt)
+        {
             if leader != producer && !missed.contains(&leader) {
                 missed.push(leader);
             }

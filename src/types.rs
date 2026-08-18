@@ -37,6 +37,28 @@ pub const EVIDENCE_MAX_AGE_BLOCKS: u64 = 100_000;
 /// Sentinel jail height for a permanently removed (tombstoned) validator.
 pub const TOMBSTONE_HEIGHT: u64 = u64::MAX;
 
+// ---- sync awareness ----
+
+/// Highest block height any peer has reported to this node. Updated by the p2p
+/// sync loop and read by block production, which must not seal a block while
+/// this node is behind: sealing on a stale tip creates a local fork that then
+/// has to be repaired by a full replay, and a 2 vCPU box can lose that race
+/// forever. Lives here so `chain` can read it without depending on `p2p`.
+pub static BEST_PEER_HEIGHT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How far behind the best known peer this node may be and still produce.
+/// One slot of jitter is normal; more than that means we are genuinely lagging.
+pub const PRODUCE_LAG_TOLERANCE: u64 = 2;
+
+pub fn note_peer_height(height: u64) {
+    use std::sync::atomic::Ordering;
+    BEST_PEER_HEIGHT.fetch_max(height, Ordering::Relaxed);
+}
+
+pub fn best_peer_height() -> u64 {
+    BEST_PEER_HEIGHT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn format_inaz(rai: u128) -> String {
     let whole = rai / RAI_PER_INAZ;
     let frac = rai % RAI_PER_INAZ;
@@ -57,7 +79,11 @@ pub fn parse_inaz(s: &str) -> Result<u128, String> {
     while frac.len() < 9 {
         frac.push('0');
     }
-    let frac: u128 = if frac.is_empty() { 0 } else { frac.parse().map_err(|_| "bad amount".to_string())? };
+    let frac: u128 = if frac.is_empty() {
+        0
+    } else {
+        frac.parse().map_err(|_| "bad amount".to_string())?
+    };
     Ok(whole * RAI_PER_INAZ + frac)
 }
 
@@ -234,6 +260,16 @@ impl Payload {
     }
 }
 
+/// The signed preimage joins fields with `|`, so a field that itself contains a
+/// `|` could shift the field boundaries and make one signature valid for two
+/// different transactions. Every signed string field is therefore required to
+/// be delimiter-free; this is checked before a signature is ever trusted, which
+/// makes the encoding unambiguous without changing the preimage format (and so
+/// without a hard fork).
+pub fn delimiter_free(s: &str) -> bool {
+    !s.contains('|')
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Transaction {
     pub kind: TxKind,
@@ -252,11 +288,34 @@ pub struct Transaction {
 }
 
 impl Transaction {
+    /// True when no signed field can shift the preimage's field boundaries.
+    pub fn fields_unambiguous(&self) -> bool {
+        if !delimiter_free(&self.from_pubkey) || !delimiter_free(&self.to) {
+            return false;
+        }
+        match &self.payload {
+            None => true,
+            Some(p) => {
+                delimiter_free(&p.token)
+                    && delimiter_free(&p.symbol)
+                    && delimiter_free(&p.name)
+                    && delimiter_free(&p.code)
+                    && delimiter_free(&p.args)
+            }
+        }
+    }
+
     /// Canonical bytes that get signed. Deterministic, no JSON ambiguity.
     pub fn signing_bytes(&self) -> Vec<u8> {
         let base = format!(
             "inazuma-tx|{}|{}|{}|{}|{}|{}|{}",
-            self.chain_id, self.kind.tag(), self.from_pubkey, self.to, self.amount, self.fee, self.nonce
+            self.chain_id,
+            self.kind.tag(),
+            self.from_pubkey,
+            self.to,
+            self.amount,
+            self.fee,
+            self.nonce
         );
         match &self.payload {
             // Legacy transfers keep byte-for-byte compatible signing bytes.
@@ -282,7 +341,8 @@ impl Transaction {
     }
 
     pub fn verify_signature(&self) -> bool {
-        verify(&self.from_pubkey, &self.signing_bytes(), &self.signature)
+        self.fields_unambiguous()
+            && verify(&self.from_pubkey, &self.signing_bytes(), &self.signature)
     }
 }
 
@@ -309,10 +369,7 @@ pub fn txs_root(txs: &[Transaction]) -> String {
     if txs.is_empty() {
         return hash_hex(b"inazuma-empty");
     }
-    let mut level: Vec<[u8; 32]> = txs
-        .iter()
-        .map(|t| sha256(t.hash().as_bytes()))
-        .collect();
+    let mut level: Vec<[u8; 32]> = txs.iter().map(|t| sha256(t.hash().as_bytes())).collect();
     while level.len() > 1 {
         let mut next = Vec::new();
         for pair in level.chunks(2) {
@@ -400,5 +457,51 @@ impl Genesis {
                 stake: None,
             }],
         }
+    }
+}
+
+#[cfg(test)]
+mod signing_tests {
+    use super::*;
+
+    fn tx(to: &str, payload: Option<Payload>) -> Transaction {
+        Transaction {
+            kind: TxKind::Transfer,
+            from_pubkey: "ab".repeat(32),
+            to: to.to_string(),
+            amount: 1,
+            fee: MIN_FEE,
+            nonce: 0,
+            chain_id: CHAIN_ID,
+            payload,
+            signature: String::new(),
+        }
+    }
+
+    #[test]
+    fn delimiter_injection_is_refused() {
+        // Without the guard these two produce the same signed preimage, so one
+        // signature would authorise both.
+        let a = tx("alice|1|2", None);
+        let b = tx("alice", None);
+        assert!(!a.fields_unambiguous());
+        assert!(b.fields_unambiguous());
+        // A forged signature can never be accepted on an ambiguous tx.
+        assert!(!a.verify_signature());
+    }
+
+    #[test]
+    fn payload_fields_are_checked_too() {
+        let mut p = Payload::default();
+        p.symbol = "IN|AZ".into();
+        assert!(!tx("alice", Some(p)).fields_unambiguous());
+    }
+
+    #[test]
+    fn distinct_txs_never_share_signing_bytes() {
+        let a = tx("alice", None);
+        let mut b = tx("alice", None);
+        b.nonce = 1;
+        assert_ne!(a.signing_bytes(), b.signing_bytes());
     }
 }

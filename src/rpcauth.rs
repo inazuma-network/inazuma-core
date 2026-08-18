@@ -41,16 +41,40 @@ impl Tier {
     }
 }
 
-/// Methods only an operator key may call: they expose peer topology or act on
-/// the node's own view of the network rather than on public chain data.
-pub const PRIVILEGED_METHODS: &[&str] = &["inaz_netInfo", "inaz_rpcLimits"];
+/// Methods only an operator key may call: they expose the node's own view of
+/// itself rather than public chain data.
+///
+/// These are gated *unconditionally* — a node with no admin key configured
+/// refuses them rather than serving them to everyone. The old gate was
+/// `contains(method) && auth_enabled()`, which meant a public node with no
+/// keys (the normal case) left them wide open: fail-open authorization.
+///
+/// `inaz_netInfo` is deliberately NOT here: it now answers every caller, but
+/// redacts peer IPs, the dial list and the allowlist unless the caller is an
+/// admin. Public callers still get the safe security summary.
+/// `inaz_halt` / `inaz_resume` freeze and unfreeze consensus on this node, and
+/// `inaz_prune` deletes history, so they are admin-only for the same reason.
+/// `inaz_haltStatus` is public: users are entitled to know a node is frozen.
+pub const PRIVILEGED_METHODS: &[&str] =
+    &["inaz_rpcLimits", "inaz_halt", "inaz_resume", "inaz_prune"];
+
+/// True when the caller may see peer topology: IP addresses, the configured
+/// dial list and the node-key allowlist. Anything that helps an attacker map
+/// or eclipse the validator set lives behind this.
+pub fn may_see_topology(tier: Tier) -> bool {
+    tier == Tier::Admin
+}
 
 /// How much of a caller's budget a method spends. Reads that touch one key are
 /// cheap; whole-tree walks, proofs and bulk submits are not.
 pub fn method_cost(method: &str, params: &serde_json::Value) -> f64 {
     match method {
         "inaz_sendTransactions" => {
-            let n = params.get("txs").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(1);
+            let n = params
+                .get("txs")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len())
+                .unwrap_or(1);
             // One unit per 50 transactions, so a 5,000-tx batch costs 100 units.
             2.0 + (n as f64 / 50.0)
         }
@@ -58,7 +82,11 @@ pub fn method_cost(method: &str, params: &serde_json::Value) -> f64 {
         // Preflight runs the same checks as admission, so it is priced like one.
         "inaz_simulateTransaction" => 3.0,
         "inaz_signatureStatuses" => {
-            let n = params.get("hashes").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(1);
+            let n = params
+                .get("hashes")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len())
+                .unwrap_or(1);
             1.0 + (n as f64 / 25.0)
         }
         "inaz_subscribe" => 2.0,
@@ -85,8 +113,19 @@ pub struct RpcConfig {
 }
 
 impl RpcConfig {
-    pub fn new(keys: Vec<String>, admin_keys: Vec<String>, require_auth: bool, trust_proxy: bool) -> Self {
-        RpcConfig::with_qos(keys, admin_keys, require_auth, trust_proxy, StakeQos::new(Vec::new()))
+    pub fn new(
+        keys: Vec<String>,
+        admin_keys: Vec<String>,
+        require_auth: bool,
+        trust_proxy: bool,
+    ) -> Self {
+        RpcConfig::with_qos(
+            keys,
+            admin_keys,
+            require_auth,
+            trust_proxy,
+            StakeQos::new(Vec::new()),
+        )
     }
 
     pub fn with_qos(
@@ -133,7 +172,9 @@ impl RpcConfig {
 
     /// Resolve a presented credential to a tier without leaking timing.
     pub fn tier_for(&self, presented: Option<&str>) -> Tier {
-        let Some(p) = presented else { return Tier::Anonymous };
+        let Some(p) = presented else {
+            return Tier::Anonymous;
+        };
         let mut found = Tier::Anonymous;
         for (k, tier) in &self.keys {
             if secret_eq(k, p) {
@@ -191,6 +232,27 @@ mod tests {
     }
 
     #[test]
+    fn topology_is_admin_only() {
+        // Peer IPs / dial list / allowlist must never be visible to anonymous
+        // or ordinary keyed callers, whether or not any key is configured.
+        assert!(!may_see_topology(Tier::Anonymous));
+        assert!(!may_see_topology(Tier::Key));
+        assert!(may_see_topology(Tier::Admin));
+    }
+
+    #[test]
+    fn privileged_methods_are_not_public_on_a_keyless_node() {
+        // Regression: the gate used to be skipped entirely when no keys were
+        // configured, which published operator methods to the internet.
+        for m in PRIVILEGED_METHODS {
+            assert!(m.starts_with("inaz_"), "{} is not an rpc method", m);
+        }
+        assert!(PRIVILEGED_METHODS.contains(&"inaz_rpcLimits"));
+        // netInfo answers everyone, but self-redacts instead of being blocked.
+        assert!(!PRIVILEGED_METHODS.contains(&"inaz_netInfo"));
+    }
+
+    #[test]
     fn tiers_and_auth_gate() {
         let cfg = RpcConfig::new(
             vec!["user-key-0123456789abcdef".into()],
@@ -202,7 +264,10 @@ mod tests {
         assert_eq!(cfg.tier_for(None), Tier::Anonymous);
         assert_eq!(cfg.tier_for(Some("nope")), Tier::Anonymous);
         assert_eq!(cfg.tier_for(Some("user-key-0123456789abcdef")), Tier::Key);
-        assert_eq!(cfg.tier_for(Some("admin-key-0123456789abcdef")), Tier::Admin);
+        assert_eq!(
+            cfg.tier_for(Some("admin-key-0123456789abcdef")),
+            Tier::Admin
+        );
 
         // require_auth cannot brick an endpoint that has no keys configured.
         assert!(!RpcConfig::new(vec![], vec![], true, false).require_auth);
@@ -217,7 +282,11 @@ mod tests {
                 allowed += 1;
             }
         }
-        assert!(allowed <= ANON_BURST as usize + 2, "anon flood not bounded: {}", allowed);
+        assert!(
+            allowed <= ANON_BURST as usize + 2,
+            "anon flood not bounded: {}",
+            allowed
+        );
 
         let big = json!({ "txs": vec![json!({}); 5_000] });
         assert!(method_cost("inaz_sendTransactions", &big) >= 100.0);

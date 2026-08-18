@@ -150,7 +150,9 @@ pub fn preflight(node: &Node, tx: &Transaction) -> Value {
     // A transaction paying exactly the floor is valid now, but the floor moves
     // with demand, so tell the caller instead of letting it fail later.
     if errors.is_empty() && tx.fee < floor.saturating_mul(2) {
-        warnings.push("fee is close to the current base fee; it may be crowded out if demand rises".into());
+        warnings.push(
+            "fee is close to the current base fee; it may be crowded out if demand rises".into(),
+        );
     }
 
     json!({

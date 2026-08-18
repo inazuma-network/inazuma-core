@@ -58,7 +58,12 @@ impl Channel {
     /// Parse a subscription request. Filters are mandatory where a missing filter
     /// would turn a cheap subscription into a firehose of every account update.
     pub fn parse(channel: &str, params: &Value) -> Result<Channel, String> {
-        let get = |k: &str| params.get(k).and_then(|v| v.as_str()).map(|s| s.trim().to_string());
+        let get = |k: &str| {
+            params
+                .get(k)
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+        };
         match channel {
             "heads" | "newHeads" => Ok(Channel::Heads),
             "finality" => Ok(Channel::Finality),
@@ -105,7 +110,11 @@ pub struct Event {
 
 impl Event {
     pub fn new(channel: &'static str, key: Option<String>, payload: Value) -> Self {
-        Event { channel, key, payload }
+        Event {
+            channel,
+            key,
+            payload,
+        }
     }
 }
 
@@ -151,7 +160,15 @@ impl EventBus {
             return Err("too many subscriptions on this connection".into());
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
-        subs.insert(id, Sub { channel, conn, tx: sender.0.clone(), strikes: 0 });
+        subs.insert(
+            id,
+            Sub {
+                channel,
+                conn,
+                tx: sender.0.clone(),
+                strikes: 0,
+            },
+        );
         Ok(id)
     }
 
@@ -245,7 +262,9 @@ mod tests {
 
         let bus = EventBus::new();
         let (tx, rx) = queue();
-        let id = bus.subscribe(1, Channel::Signature("ab".repeat(32)), &tx).unwrap();
+        let id = bus
+            .subscribe(1, Channel::Signature("ab".repeat(32)), &tx)
+            .unwrap();
         // A different connection cannot cancel someone else's subscription.
         assert!(!bus.unsubscribe(2, id));
         bus.publish(Event::new("signature", Some("cd".repeat(32)), json!({})));
@@ -264,6 +283,9 @@ mod tests {
         for i in 0..(QUEUE_DEPTH + MAX_LAG_STRIKES as usize + 8) {
             bus.publish(Event::new("heads", None, json!({ "height": i })));
         }
-        assert!(bus.is_empty(), "a consumer that never reads must be evicted");
+        assert!(
+            bus.is_empty(),
+            "a consumer that never reads must be evicted"
+        );
     }
 }

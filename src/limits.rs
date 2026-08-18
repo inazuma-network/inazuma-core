@@ -19,7 +19,11 @@ pub struct RateLimiter {
 
 impl RateLimiter {
     pub fn new(rate: f64, burst: f64) -> Self {
-        RateLimiter { rate, burst, buckets: Mutex::new(HashMap::new()) }
+        RateLimiter {
+            rate,
+            burst,
+            buckets: Mutex::new(HashMap::new()),
+        }
     }
 
     pub fn allow(&self, ip: IpAddr) -> bool {
@@ -59,7 +63,11 @@ pub struct KeyedLimiter {
 
 impl KeyedLimiter {
     pub fn new(rate: f64, burst: f64) -> Self {
-        KeyedLimiter { rate, burst, buckets: Mutex::new(HashMap::new()) }
+        KeyedLimiter {
+            rate,
+            burst,
+            buckets: Mutex::new(HashMap::new()),
+        }
     }
 
     pub fn allow_cost(&self, key: &str, cost: f64) -> bool {
@@ -109,7 +117,10 @@ pub struct ConnTicket<'a>(&'a ConnGuard);
 
 impl ConnGuard {
     pub fn new(max: usize) -> Self {
-        ConnGuard { live: AtomicUsize::new(0), max }
+        ConnGuard {
+            live: AtomicUsize::new(0),
+            max,
+        }
     }
 
     pub fn try_acquire(&self) -> Option<ConnTicket<'_>> {
@@ -118,7 +129,10 @@ impl ConnGuard {
             if cur >= self.max {
                 return None;
             }
-            match self.live.compare_exchange(cur, cur + 1, Ordering::SeqCst, Ordering::Relaxed) {
+            match self
+                .live
+                .compare_exchange(cur, cur + 1, Ordering::SeqCst, Ordering::Relaxed)
+            {
                 Ok(_) => return Some(ConnTicket(self)),
                 Err(actual) => cur = actual,
             }
@@ -204,7 +218,12 @@ impl PeerBook {
     }
 
     pub fn known_identities(&self) -> Vec<(IpAddr, String)> {
-        self.identities.lock().unwrap().iter().map(|(k, v)| (*k, v.clone())).collect()
+        self.identities
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect()
     }
 
     pub fn banned_count(&self) -> usize {
@@ -232,7 +251,10 @@ pub struct IpTicket<'a> {
 
 impl IpConnCounter {
     pub fn new(max_per_ip: usize) -> Self {
-        IpConnCounter { live: Mutex::new(HashMap::new()), max_per_ip }
+        IpConnCounter {
+            live: Mutex::new(HashMap::new()),
+            max_per_ip,
+        }
     }
 
     pub fn try_acquire(&self, ip: IpAddr) -> Option<IpTicket<'_>> {

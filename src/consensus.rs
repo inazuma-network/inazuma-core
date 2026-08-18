@@ -41,7 +41,12 @@ impl Vote {
     }
 
     pub fn verify_signature(&self) -> bool {
-        verify(&self.voter_pubkey, &self.signing_bytes(), &self.signature)
+        // Same rule as transactions: a `|` inside a signed field could move the
+        // field boundaries and let one signature cover two different votes.
+        // Block hashes and pubkeys are hex, so this only ever rejects forgeries.
+        crate::types::delimiter_free(&self.hash)
+            && crate::types::delimiter_free(&self.voter_pubkey)
+            && verify(&self.voter_pubkey, &self.signing_bytes(), &self.signature)
     }
 }
 
@@ -56,6 +61,7 @@ pub struct VoteTracker {
     evidence: Mutex<Vec<Evidence>>,
 }
 
+#[derive(Debug)]
 pub struct VoteOutcome {
     /// True when this vote was new and worth gossiping onward.
     pub fresh: bool,
@@ -79,24 +85,56 @@ impl VoteTracker {
         // provable equivocation: keep the pair as evidence.
         if let Some(prev) = self.first_vote(vote.height, &voter) {
             if prev.hash != vote.hash {
-                self.push_evidence(Evidence::Vote { a: prev, b: vote.clone() });
+                self.push_evidence(Evidence::Vote {
+                    a: prev,
+                    b: vote.clone(),
+                });
                 return Err("equivocating vote: evidence recorded".into());
             }
         }
         if vote.height <= store.finalized_height() {
-            return Ok(VoteOutcome { fresh: false, finalized: None });
+            return Ok(VoteOutcome {
+                fresh: false,
+                finalized: None,
+            });
         }
         match store.block(vote.height) {
             Some(b) if b.hash == vote.hash => {}
             Some(_) => return Err("vote for a different block at this height".into()),
             None => {
                 // The block is still in flight; keep the vote and replay it later.
+                //
+                // Only bonded validators may occupy this buffer. It used to
+                // accept any signed vote, so anyone could generate 4,096 throwaway
+                // keys, fill the buffer with votes for heights that will never
+                // exist, and push out the real precommits as they arrived —
+                // stalling finality for free, with no stake at risk.
+                let set = staking::validator_set(store);
+                if !set.iter().any(|v| v.address == voter) {
+                    return Err("voter is not a bonded validator".into());
+                }
                 let mut pending = self.pending.lock().unwrap();
-                if pending.len() > 4_096 {
+                // One slot per (validator, height) so a single validator cannot
+                // crowd the buffer either.
+                if pending
+                    .iter()
+                    .any(|v| v.height == vote.height && v.voter_pubkey == vote.voter_pubkey)
+                {
+                    return Ok(VoteOutcome {
+                        fresh: false,
+                        finalized: None,
+                    });
+                }
+                // Bound the buffer by the set size, not by an arbitrary constant.
+                let cap = (set.len().max(1) * 64).min(4_096);
+                if pending.len() >= cap {
                     pending.remove(0);
                 }
                 pending.push(vote);
-                return Ok(VoteOutcome { fresh: true, finalized: None });
+                return Ok(VoteOutcome {
+                    fresh: true,
+                    finalized: None,
+                });
             }
         }
         let set = staking::validator_set(store);
@@ -130,14 +168,23 @@ impl VoteTracker {
         let total = staking::total_stake(&set);
         let guard = self.inner.lock().unwrap();
         let voted = match guard.get(&height) {
-            Some(at) => set.iter().filter(|v| at.contains_key(&v.address)).map(|v| v.stake).sum(),
+            Some(at) => set
+                .iter()
+                .filter(|v| at.contains_key(&v.address))
+                .map(|v| v.stake)
+                .sum(),
             None => 0,
         };
         (voted, total)
     }
 
     pub fn seen(&self, height: u64) -> usize {
-        self.inner.lock().unwrap().get(&height).map(|m| m.len()).unwrap_or(0)
+        self.inner
+            .lock()
+            .unwrap()
+            .get(&height)
+            .map(|m| m.len())
+            .unwrap_or(0)
     }
 
     /// The first precommit this node saw from `voter` at `height`, if any.
@@ -166,9 +213,8 @@ impl VoteTracker {
     pub fn replay_pending(&self, store: &Store, height: u64) -> Option<u64> {
         let ready: Vec<Vote> = {
             let mut pending = self.pending.lock().unwrap();
-            let (ready, keep): (Vec<Vote>, Vec<Vote>) = pending
-                .drain(..)
-                .partition(|v| v.height == height);
+            let (ready, keep): (Vec<Vote>, Vec<Vote>) =
+                pending.drain(..).partition(|v| v.height == height);
             *pending = keep
                 .into_iter()
                 .filter(|v| v.height > store.finalized_height())

@@ -1,7 +1,8 @@
 //! Inazuma state store: accounts, blocks, tx index. Backed by an embedded KV store.
 
-use crate::crypto::sha256;
 use crate::contracts::{Contract, Receipt};
+use crate::crypto::sha256;
+use crate::journal::Journal;
 use crate::smt::Smt;
 use crate::tokens::Token;
 use crate::types::{Account, Block};
@@ -35,7 +36,24 @@ pub struct Store {
     slashes: Tree,
     /// Sparse Merkle tree nodes over all consensus state.
     smt_nodes: Tree,
+    /// Undo log for the block currently executing (see `journal.rs`).
+    journal: Journal,
 }
+
+/// Stable tree ids for the journal. Order must match `Store::trees()`.
+const T_ACCOUNTS: usize = 0;
+const T_BLOCKS: usize = 1;
+const T_TXS: usize = 2;
+const T_META: usize = 3;
+const T_STAKERS: usize = 4;
+const T_TOKENS: usize = 5;
+const T_TOKEN_BALANCES: usize = 6;
+const T_CONTRACTS: usize = 7;
+const T_CONTRACT_CODE: usize = 8;
+const T_CONTRACT_STORAGE: usize = 9;
+const T_RECEIPTS: usize = 10;
+const T_SLASHES: usize = 11;
+pub(crate) const T_SMT: usize = 12;
 
 impl Store {
     pub fn open(path: &str) -> Result<Self, String> {
@@ -50,18 +68,87 @@ impl Store {
             token_balances: db.open_tree("token_balances").map_err(|e| e.to_string())?,
             contracts: db.open_tree("contracts").map_err(|e| e.to_string())?,
             contract_code: db.open_tree("contract_code").map_err(|e| e.to_string())?,
-            contract_storage: db.open_tree("contract_storage").map_err(|e| e.to_string())?,
+            contract_storage: db
+                .open_tree("contract_storage")
+                .map_err(|e| e.to_string())?,
             receipts: db.open_tree("receipts").map_err(|e| e.to_string())?,
             slashes: db.open_tree("slashes").map_err(|e| e.to_string())?,
             smt_nodes: db.open_tree("smt").map_err(|e| e.to_string())?,
+            journal: Journal::new(),
             _db: db,
         })
+    }
+
+    // ---- atomic block execution ----
+
+    /// Trees in journal-id order.
+    fn trees(&self) -> Vec<&Tree> {
+        vec![
+            &self.accounts,
+            &self.blocks,
+            &self.txs,
+            &self.meta,
+            &self.stakers,
+            &self.tokens,
+            &self.token_balances,
+            &self.contracts,
+            &self.contract_code,
+            &self.contract_storage,
+            &self.receipts,
+            &self.slashes,
+            &self.smt_nodes,
+        ]
+    }
+
+    /// Start recording writes so a rejected block can be undone completely.
+    pub fn begin_block(&self) {
+        self.journal.begin();
+    }
+
+    /// Keep everything the block wrote.
+    pub fn commit_block(&self) {
+        self.journal.commit();
+    }
+
+    /// Undo every write since `begin_block`, leaving state exactly as it was.
+    pub fn abort_block(&self) {
+        let trees = self.trees();
+        self.journal.rollback(&trees);
+    }
+
+    /// Open a savepoint around one transaction. A transaction that fails partway
+    /// through its writes must leave nothing behind: it gets dropped from the
+    /// block, so any surviving write would put the producer's state root beyond
+    /// what an importer replaying that block can reproduce — a permanent fork.
+    pub fn begin_tx(&self) {
+        self.journal.begin();
+    }
+
+    /// Keep this transaction's writes (still undoable if the block is rejected).
+    pub fn commit_tx(&self) {
+        self.journal.commit();
+    }
+
+    /// Undo just this transaction's writes.
+    pub fn abort_tx(&self) {
+        let trees = self.trees();
+        self.journal.rollback(&trees);
+    }
+
+    fn jput(&self, id: usize, tree: &Tree, key: &[u8], value: &[u8]) {
+        self.journal.record(id, tree, key);
+        let _ = tree.insert(key, value);
+    }
+
+    fn jdel(&self, id: usize, tree: &Tree, key: &[u8]) {
+        self.journal.record(id, tree, key);
+        let _ = tree.remove(key);
     }
 
     // ---- merkleized state ----
 
     fn smt(&self) -> Smt<'_> {
-        Smt::new(&self.smt_nodes)
+        Smt::journaled(&self.smt_nodes, &self.journal)
     }
 
     /// Current Merkle root of all consensus state.
@@ -96,7 +183,12 @@ impl Store {
                 .flatten()
                 .and_then(|v| serde_json::from_slice::<Token>(&v).ok())
                 .map(|t| Self::token_leaf(&t)),
-            "tokenbal" => self.token_balances.get(k).ok().flatten().map(|v| v.to_vec()),
+            "tokenbal" => self
+                .token_balances
+                .get(k)
+                .ok()
+                .flatten()
+                .map(|v| v.to_vec()),
             "contract" => self
                 .contracts
                 .get(k)
@@ -104,7 +196,12 @@ impl Store {
                 .flatten()
                 .and_then(|v| serde_json::from_slice::<Contract>(&v).ok())
                 .map(|c| Self::contract_leaf(&c)),
-            "cstorage" => self.contract_storage.get(k).ok().flatten().map(|v| v.to_vec()),
+            "cstorage" => self
+                .contract_storage
+                .get(k)
+                .ok()
+                .flatten()
+                .map(|v| v.to_vec()),
             _ => None,
         }
     }
@@ -134,7 +231,11 @@ impl Store {
     }
 
     fn token_leaf(t: &Token) -> Vec<u8> {
-        format!("{}|{}|{}|{}|{}", t.symbol, t.decimals, t.supply, t.creator, t.mintable).into_bytes()
+        format!(
+            "{}|{}|{}|{}|{}",
+            t.symbol, t.decimals, t.supply, t.creator, t.mintable
+        )
+        .into_bytes()
     }
 
     fn contract_leaf(c: &Contract) -> Vec<u8> {
@@ -168,7 +269,7 @@ impl Store {
             smt.set("cstorage", &item.0, Some(&item.1));
         }
         let _ = self.smt_nodes.flush();
-        let _ = self.meta.insert(b"smt_version", b"1");
+        self.jput(T_META, &self.meta, b"smt_version", b"1");
         let _ = self.meta.flush();
     }
 
@@ -181,13 +282,20 @@ impl Store {
 
     pub fn base_fee(&self) -> u128 {
         match self.meta.get(b"base_fee") {
-            Ok(Some(v)) => String::from_utf8_lossy(&v).parse().unwrap_or(crate::types::MIN_FEE),
+            Ok(Some(v)) => String::from_utf8_lossy(&v)
+                .parse()
+                .unwrap_or(crate::types::MIN_FEE),
             _ => crate::types::MIN_FEE,
         }
     }
 
     pub fn set_base_fee(&self, fee: u128) {
-        let _ = self.meta.insert(b"base_fee", fee.to_string().into_bytes());
+        self.jput(
+            T_META,
+            &self.meta,
+            b"base_fee",
+            &fee.to_string().into_bytes(),
+        );
     }
 
     // ---- contracts ----
@@ -196,7 +304,7 @@ impl Store {
 
     pub fn put_slash(&self, record: &crate::slashing::SlashRecord) {
         let v = serde_json::to_vec(record).expect("encode slash");
-        let _ = self.slashes.insert(record.id.as_bytes(), v);
+        self.jput(T_SLASHES, &self.slashes, record.id.as_bytes(), &v);
         let _ = self.slashes.flush();
     }
 
@@ -228,8 +336,12 @@ impl Store {
 
     pub fn set_contract(&self, c: &Contract) {
         let v = serde_json::to_vec(c).expect("encode contract");
-        let _ = self.contracts.insert(c.address.as_bytes(), v);
-        self.smt().set("contract", c.address.as_bytes(), Some(&Self::contract_leaf(c)));
+        self.jput(T_CONTRACTS, &self.contracts, c.address.as_bytes(), &v);
+        self.smt().set(
+            "contract",
+            c.address.as_bytes(),
+            Some(&Self::contract_leaf(c)),
+        );
     }
 
     pub fn contract_count(&self) -> usize {
@@ -249,7 +361,7 @@ impl Store {
     }
 
     pub fn put_code(&self, hash: &str, code: &[u8]) {
-        let _ = self.contract_code.insert(hash.as_bytes(), code);
+        self.jput(T_CONTRACT_CODE, &self.contract_code, hash.as_bytes(), code);
     }
 
     pub fn code(&self, hash: &str) -> Option<Vec<u8>> {
@@ -274,11 +386,11 @@ impl Store {
         let k = Self::storage_key(address, key);
         match value {
             Some(v) => {
-                let _ = self.contract_storage.insert(k.clone(), v);
+                self.jput(T_CONTRACT_STORAGE, &self.contract_storage, &k, v);
                 self.smt().set("cstorage", &k, Some(v));
             }
             None => {
-                let _ = self.contract_storage.remove(k.clone());
+                self.jdel(T_CONTRACT_STORAGE, &self.contract_storage, &k);
                 self.smt().set("cstorage", &k, None);
             }
         }
@@ -301,7 +413,7 @@ impl Store {
 
     pub fn put_receipt(&self, tx_hash: &str, r: &Receipt) {
         let v = serde_json::to_vec(r).expect("encode receipt");
-        let _ = self.receipts.insert(tx_hash.as_bytes(), v);
+        self.jput(T_RECEIPTS, &self.receipts, tx_hash.as_bytes(), &v);
     }
 
     pub fn receipt(&self, tx_hash: &str) -> Option<Receipt> {
@@ -329,8 +441,9 @@ impl Store {
 
     pub fn set_token(&self, token: &Token) {
         let v = serde_json::to_vec(token).expect("encode token");
-        let _ = self.tokens.insert(token.id.as_bytes(), v);
-        self.smt().set("token", token.id.as_bytes(), Some(&Self::token_leaf(token)));
+        self.jput(T_TOKENS, &self.tokens, token.id.as_bytes(), &v);
+        self.smt()
+            .set("token", token.id.as_bytes(), Some(&Self::token_leaf(token)));
     }
 
     pub fn token_count(&self) -> usize {
@@ -363,26 +476,38 @@ impl Store {
     fn set_token_balance(&self, token: &str, address: &str, amount: u128) {
         let key = Self::balance_key(token, address);
         if amount == 0 {
-            let _ = self.token_balances.remove(key);
-            self.smt().set("tokenbal", &Self::balance_key(token, address), None);
+            self.jdel(T_TOKEN_BALANCES, &self.token_balances, &key);
+            self.smt()
+                .set("tokenbal", &Self::balance_key(token, address), None);
         } else {
             let bytes = amount.to_string().into_bytes();
-            let _ = self.token_balances.insert(key, bytes.clone());
-            self.smt().set("tokenbal", &Self::balance_key(token, address), Some(&bytes));
+            self.jput(T_TOKEN_BALANCES, &self.token_balances, &key, &bytes);
+            self.smt()
+                .set("tokenbal", &Self::balance_key(token, address), Some(&bytes));
         }
     }
 
     /// Mint units to an address and grow the recorded supply and holder count.
-    pub fn credit_token(&self, token_id: &str, address: &str, amount: u128) {
+    ///
+    /// Both additions are checked. Release builds wrap on overflow rather than
+    /// panicking, so an unchecked `supply += amount` let a token creator mint
+    /// near `u128::MAX` twice and wrap the recorded supply back to a small
+    /// number while keeping the balance — free units out of thin air.
+    pub fn credit_token(&self, token_id: &str, address: &str, amount: u128) -> Result<(), String> {
         let before = self.token_balance(token_id, address);
-        self.set_token_balance(token_id, address, before + amount);
+        let after = before.checked_add(amount).ok_or("token balance overflow")?;
         if let Some(mut t) = self.token(token_id) {
-            t.supply += amount;
+            t.supply = t
+                .supply
+                .checked_add(amount)
+                .ok_or("token supply overflow")?;
             if before == 0 && amount > 0 {
                 t.holders += 1;
             }
             self.set_token(&t);
         }
+        self.set_token_balance(token_id, address, after);
+        Ok(())
     }
 
     /// Remove units from an address, shrinking supply (burn) unless re-credited.
@@ -453,12 +578,13 @@ impl Store {
 
     pub fn set_account(&self, address: &str, acct: &Account) {
         let v = serde_json::to_vec(acct).expect("encode account");
-        let _ = self.accounts.insert(address.as_bytes(), v);
-        self.smt().set("acct", address.as_bytes(), Some(&Self::account_leaf(acct)));
+        self.jput(T_ACCOUNTS, &self.accounts, address.as_bytes(), &v);
+        self.smt()
+            .set("acct", address.as_bytes(), Some(&Self::account_leaf(acct)));
         if acct.staked > 0 || !acct.unbonding.is_empty() {
-            let _ = self.stakers.insert(address.as_bytes(), b"1");
+            self.jput(T_STAKERS, &self.stakers, address.as_bytes(), b"1");
         } else {
-            let _ = self.stakers.remove(address.as_bytes());
+            self.jdel(T_STAKERS, &self.stakers, address.as_bytes());
         }
     }
 
@@ -493,8 +619,11 @@ impl Store {
                 if let Ok(t) = serde_json::from_slice::<Token>(&v) {
                     buf.extend_from_slice(&k);
                     buf.extend_from_slice(
-                        format!("|{}|{}|{}|{}|{}|", t.symbol, t.decimals, t.supply, t.creator, t.mintable)
-                            .as_bytes(),
+                        format!(
+                            "|{}|{}|{}|{}|{}|",
+                            t.symbol, t.decimals, t.supply, t.creator, t.mintable
+                        )
+                        .as_bytes(),
                     );
                 }
             }
@@ -574,14 +703,22 @@ impl Store {
 
     pub fn put_block(&self, block: &Block) {
         let v = serde_json::to_vec(block).expect("encode block");
-        let _ = self.blocks.insert(block.height.to_be_bytes(), v);
+        self.jput(T_BLOCKS, &self.blocks, &block.height.to_be_bytes(), &v);
         for tx in &block.transactions {
-            let _ = self
-                .txs
-                .insert(tx.hash().as_bytes(), block.height.to_be_bytes().to_vec());
+            self.jput(
+                T_TXS,
+                &self.txs,
+                tx.hash().as_bytes(),
+                &block.height.to_be_bytes(),
+            );
         }
-        let _ = self.meta.insert(b"tip_height", &block.height.to_be_bytes());
-        let _ = self.meta.insert(b"tip_hash", block.hash.as_bytes());
+        self.jput(
+            T_META,
+            &self.meta,
+            b"tip_height",
+            &block.height.to_be_bytes(),
+        );
+        self.jput(T_META, &self.meta, b"tip_hash", block.hash.as_bytes());
         let _ = self.blocks.flush();
         let _ = self.meta.flush();
         let _ = self.accounts.flush();
@@ -650,7 +787,12 @@ impl Store {
         if height <= self.finalized_height() {
             return;
         }
-        let _ = self.meta.insert(b"finalized_height", &height.to_be_bytes());
+        self.jput(
+            T_META,
+            &self.meta,
+            b"finalized_height",
+            &height.to_be_bytes(),
+        );
         let _ = self.meta.flush();
     }
 
@@ -677,5 +819,143 @@ impl Store {
         self.flush_tokens();
         self.flush_contracts();
         let _ = self.meta.flush();
+    }
+}
+
+// ---- operator surface: halt, pruning, snapshots ----
+
+/// Tables a state snapshot carries. Blocks, the tx index and receipts are
+/// history, not state, so they are not part of a snapshot.
+pub const SNAPSHOT_TABLES: &[&str] = &[
+    "accounts",
+    "stakers",
+    "tokens",
+    "token_balances",
+    "contracts",
+    "contract_code",
+    "contract_storage",
+    "slashes",
+];
+
+impl Store {
+    fn table(&self, name: &str) -> Option<&Tree> {
+        Some(match name {
+            "accounts" => &self.accounts,
+            "stakers" => &self.stakers,
+            "tokens" => &self.tokens,
+            "token_balances" => &self.token_balances,
+            "contracts" => &self.contracts,
+            "contract_code" => &self.contract_code,
+            "contract_storage" => &self.contract_storage,
+            "slashes" => &self.slashes,
+            "receipts" => &self.receipts,
+            _ => return None,
+        })
+    }
+
+    /// Every key/value in a snapshot table, in key order.
+    pub fn raw_dump(&self, name: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let Some(tree) = self.table(name) else {
+            return Vec::new();
+        };
+        tree.iter()
+            .flatten()
+            .map(|(k, v)| (k.to_vec(), v.to_vec()))
+            .collect()
+    }
+
+    /// Replace a snapshot table wholesale. Snapshot import only.
+    pub fn raw_restore(&self, name: &str, entries: &[(Vec<u8>, Vec<u8>)]) -> Result<(), String> {
+        let tree = self
+            .table(name)
+            .ok_or_else(|| format!("unknown table {}", name))?;
+        tree.clear().map_err(|e| e.to_string())?;
+        for (k, v) in entries {
+            tree.insert(k.as_slice(), v.as_slice())
+                .map_err(|e| e.to_string())?;
+        }
+        tree.flush().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    // ---- emergency halt ----
+
+    /// Freeze this node: it stops sealing, voting, admitting and importing.
+    /// Operator action, persisted so a restart cannot silently unfreeze a node
+    /// that was halted for a consensus bug.
+    pub fn set_halt(&self, reason: &str) {
+        self.jput(T_META, &self.meta, b"halt_reason", reason.as_bytes());
+        let _ = self.meta.flush();
+    }
+
+    pub fn clear_halt(&self) {
+        self.jdel(T_META, &self.meta, b"halt_reason");
+        let _ = self.meta.flush();
+    }
+
+    pub fn halt_reason(&self) -> Option<String> {
+        match self.meta.get(b"halt_reason") {
+            Ok(Some(v)) => Some(String::from_utf8_lossy(&v).to_string()),
+            _ => None,
+        }
+    }
+
+    // ---- pruning ----
+
+    /// Lowest height whose block body is still stored. 0 means nothing pruned.
+    pub fn pruned_below(&self) -> u64 {
+        match self.meta.get(b"pruned_below") {
+            Ok(Some(v)) if v.len() == 8 => {
+                let mut b = [0u8; 8];
+                b.copy_from_slice(&v);
+                u64::from_be_bytes(b)
+            }
+            _ => 0,
+        }
+    }
+
+    /// Record that history below `height` is absent (snapshot import).
+    pub fn mark_pruned_below(&self, height: u64) {
+        self.jput(T_META, &self.meta, b"pruned_below", &height.to_be_bytes());
+        let _ = self.meta.flush();
+    }
+
+    /// Drop block bodies, their tx index entries and receipts below `below`.
+    ///
+    /// Only finalized history is ever eligible, and height 0 (genesis) is kept
+    /// so a node can always prove which chain it is on. State itself is never
+    /// touched: the Merkle tree and every account stay complete, so a pruned
+    /// node still validates and serves current state. Pruned nodes cannot serve
+    /// historical blocks to a syncing peer — run an archive node for that.
+    pub fn prune_blocks(&self, below: u64) -> usize {
+        let ceiling = self.finalized_height();
+        let below = below.min(ceiling);
+        if below <= 1 {
+            return 0;
+        }
+        let mut removed = 0usize;
+        for height in self.pruned_below().max(1)..below {
+            let key = height.to_be_bytes();
+            let Ok(Some(raw)) = self.blocks.get(key) else {
+                continue;
+            };
+            if let Ok(block) = serde_json::from_slice::<Block>(&raw) {
+                for tx in &block.transactions {
+                    let h = tx.hash();
+                    let _ = self.txs.remove(h.as_bytes());
+                    let _ = self.receipts.remove(h.as_bytes());
+                }
+            }
+            let _ = self.blocks.remove(key);
+            removed += 1;
+        }
+        if removed > 0 {
+            self.jput(T_META, &self.meta, b"pruned_below", &below.to_be_bytes());
+            let _ = self.blocks.flush();
+            let _ = self.txs.flush();
+            let _ = self.receipts.flush();
+            let _ = self.meta.flush();
+        }
+        removed
     }
 }

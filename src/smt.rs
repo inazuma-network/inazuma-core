@@ -96,11 +96,24 @@ pub fn leaf_hash(key: &[u8; 32], value: Option<&[u8]>) -> [u8; 32] {
 
 pub struct Smt<'a> {
     pub nodes: &'a Tree,
+    /// When set, node writes are recorded so a rejected block can be undone.
+    journal: Option<&'a crate::journal::Journal>,
 }
 
 impl<'a> Smt<'a> {
     pub fn new(nodes: &'a Tree) -> Self {
-        Smt { nodes }
+        Smt {
+            nodes,
+            journal: None,
+        }
+    }
+
+    /// Same tree, but every node write is recorded in the block undo log.
+    pub fn journaled(nodes: &'a Tree, journal: &'a crate::journal::Journal) -> Self {
+        Smt {
+            nodes,
+            journal: Some(journal),
+        }
     }
 
     fn get_node(&self, depth: usize, path: &[u8; PATH_BYTES]) -> [u8; 32] {
@@ -116,6 +129,9 @@ impl<'a> Smt<'a> {
 
     fn put_node(&self, depth: usize, path: &[u8; PATH_BYTES], hash: [u8; 32]) {
         let id = node_id(depth, path);
+        if let Some(j) = self.journal {
+            j.record(crate::state::T_SMT, self.nodes, &id);
+        }
         if hash == empty_at(depth) {
             let _ = self.nodes.remove(id);
         } else {
@@ -245,9 +261,23 @@ mod tests {
         let root = smt.root_hex();
 
         let (_lk, sibs, bm) = smt.proof("acct", b"alice");
-        assert!(verify_proof(&root, "acct", b"alice", Some(b"100|0|0|0|0"), &sibs, &bm));
+        assert!(verify_proof(
+            &root,
+            "acct",
+            b"alice",
+            Some(b"100|0|0|0|0"),
+            &sibs,
+            &bm
+        ));
         // wrong value must fail
-        assert!(!verify_proof(&root, "acct", b"alice", Some(b"999|0|0|0|0"), &sibs, &bm));
+        assert!(!verify_proof(
+            &root,
+            "acct",
+            b"alice",
+            Some(b"999|0|0|0|0"),
+            &sibs,
+            &bm
+        ));
 
         // non-inclusion proof for an untouched key
         let (_lk, sibs, bm) = smt.proof("acct", b"carol");

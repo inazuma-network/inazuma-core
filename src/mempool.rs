@@ -62,7 +62,12 @@ impl Mempool {
         *self.per_sender.entry(sender.clone()).or_insert(0) += 1;
         let seq = self.next_seq;
         self.next_seq += 1;
-        self.entries.push(PoolTx { tx, hash, sender, seq });
+        self.entries.push(PoolTx {
+            tx,
+            hash,
+            sender,
+            seq,
+        });
     }
 
     pub fn is_full(&self) -> bool {
@@ -82,13 +87,10 @@ impl Mempool {
                 *entry = (i, e.tx.nonce);
             }
         }
-        let victim = tail
-            .values()
-            .map(|&(i, _)| i)
-            .min_by(|&a, &b| {
-                let (x, y) = (&self.entries[a], &self.entries[b]);
-                x.tx.fee.cmp(&y.tx.fee).then(y.seq.cmp(&x.seq))
-            })?;
+        let victim = tail.values().map(|&(i, _)| i).min_by(|&a, &b| {
+            let (x, y) = (&self.entries[a], &self.entries[b]);
+            x.tx.fee.cmp(&y.tx.fee).then(y.seq.cmp(&x.seq))
+        })?;
         if self.entries[victim].tx.fee >= incoming_fee {
             return None; // nothing cheaper than the newcomer: reject it instead
         }

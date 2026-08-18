@@ -12,6 +12,19 @@ pub const BLOCK_REWARD: u128 = RAI_PER_INAZ / 100; // 0.01 INAZ
 /// Share of the block reward the elected leader keeps for doing the work.
 pub const LEADER_COMMISSION_PCT: u128 = 20;
 
+/// Hard cap on the active validator set.
+///
+/// Gossip and precommit traffic grow with the set: every validator votes on
+/// every height and every vote reaches every peer, so an unbounded set turns
+/// into a bandwidth denial-of-service on itself. Above the cap, only the
+/// highest-staked accounts are electable; the rest stay bonded, keep earning
+/// nothing, and rotate in as soon as they out-stake a member.
+pub const MAX_VALIDATORS: usize = 100;
+
+/// The cap changes which blocks are valid, so it activates at a fixed future
+/// height. Below it every node keeps reproducing old history byte-identically.
+pub const VALIDATOR_CAP_ACTIVATION_HEIGHT: u64 = 2_000_000;
+
 #[derive(Debug, Clone)]
 pub struct Validator {
     pub address: String,
@@ -34,7 +47,7 @@ pub fn validator_set(store: &Store) -> Vec<Validator> {
 /// Active validator set as of `height`: every account staking at least
 /// `MIN_STAKE` that is neither jailed nor tombstoned, in address order.
 pub fn validator_set_at(store: &Store, height: u64) -> Vec<Validator> {
-    store
+    let mut set: Vec<Validator> = store
         .stake_accounts()
         .into_iter()
         .filter(|(_, a)| a.is_active_validator(height))
@@ -48,7 +61,20 @@ pub fn validator_set_at(store: &Store, height: u64) -> Vec<Validator> {
             missed_slots: a.penalties.missed_slots,
             slashed: a.penalties.slashed,
         })
-        .collect()
+        .collect();
+    if height >= VALIDATOR_CAP_ACTIVATION_HEIGHT && set.len() > MAX_VALIDATORS {
+        // Highest stake wins; address order breaks ties so every node truncates
+        // the same way. The survivors are then put back in address order because
+        // leader election walks the set in order.
+        set.sort_by(|a, b| {
+            b.stake
+                .cmp(&a.stake)
+                .then_with(|| a.address.cmp(&b.address))
+        });
+        set.truncate(MAX_VALIDATORS);
+        set.sort_by(|a, b| a.address.cmp(&b.address));
+    }
+    set
 }
 
 /// Every bonded account including jailed and tombstoned ones, for reporting.

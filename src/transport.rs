@@ -95,7 +95,10 @@ pub(crate) struct Aead2 {
 
 impl Aead2 {
     fn new(key: [u8; 32]) -> Self {
-        Aead2 { cipher: ChaCha20Poly1305::new(Key::from_slice(&key)), counter: 0 }
+        Aead2 {
+            cipher: ChaCha20Poly1305::new(Key::from_slice(&key)),
+            counter: 0,
+        }
     }
 
     fn nonce(&mut self) -> Nonce {
@@ -108,14 +111,26 @@ impl Aead2 {
     fn seal(&mut self, plain: &[u8]) -> Result<Vec<u8>, String> {
         let n = self.nonce();
         self.cipher
-            .encrypt(&n, Payload { msg: plain, aad: MAGIC })
+            .encrypt(
+                &n,
+                Payload {
+                    msg: plain,
+                    aad: MAGIC,
+                },
+            )
             .map_err(|_| "seal failed".to_string())
     }
 
     fn open(&mut self, ct: &[u8]) -> Result<Vec<u8>, String> {
         let n = self.nonce();
         self.cipher
-            .decrypt(&n, Payload { msg: ct, aad: MAGIC })
+            .decrypt(
+                &n,
+                Payload {
+                    msg: ct,
+                    aad: MAGIC,
+                },
+            )
             .map_err(|_| "decrypt failed (wrong key, replay or tampering)".to_string())
     }
 }
@@ -193,7 +208,9 @@ impl Channel {
                 }
                 let ct = read_exact(stream, n)?;
                 let plain = recv.open(&ct)?;
-                serde_json::from_slice(&plain).map(Some).map_err(|e| e.to_string())
+                serde_json::from_slice(&plain)
+                    .map(Some)
+                    .map_err(|e| e.to_string())
             }
             Channel::Plain { reader, prefix, .. } => {
                 let mut line = String::from_utf8(std::mem::take(prefix)).unwrap_or_default();
@@ -207,7 +224,9 @@ impl Channel {
                 if line.trim().is_empty() {
                     return Ok(Some(Value::Null));
                 }
-                serde_json::from_str(&line).map(Some).map_err(|e| e.to_string())
+                serde_json::from_str(&line)
+                    .map(Some)
+                    .map_err(|e| e.to_string())
             }
         }
     }
@@ -289,7 +308,11 @@ pub fn handshake_responder(
 
 pub fn plain_channel(stream: TcpStream, prefix: Vec<u8>) -> Result<Channel, String> {
     let writer = stream.try_clone().map_err(|e| e.to_string())?;
-    Ok(Channel::Plain { reader: BufReader::new(stream), writer, prefix })
+    Ok(Channel::Plain {
+        reader: BufReader::new(stream),
+        writer,
+        prefix,
+    })
 }
 
 /// A fresh X25519 scalar from the OS RNG. Discarded with the session, which is

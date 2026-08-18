@@ -45,7 +45,9 @@ impl Keypair {
     pub fn generate() -> Self {
         let mut seed = [0u8; 32];
         getrandom::getrandom(&mut seed).expect("os rng");
-        Keypair { signing: SigningKey::from_bytes(&seed) }
+        Keypair {
+            signing: SigningKey::from_bytes(&seed),
+        }
     }
 
     pub fn from_secret_hex(s: &str) -> Result<Self, String> {
@@ -55,7 +57,9 @@ impl Keypair {
         }
         let mut seed = [0u8; 32];
         seed.copy_from_slice(&raw);
-        Ok(Keypair { signing: SigningKey::from_bytes(&seed) })
+        Ok(Keypair {
+            signing: SigningKey::from_bytes(&seed),
+        })
     }
 
     pub fn secret_hex(&self) -> String {

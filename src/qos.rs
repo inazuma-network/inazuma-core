@@ -39,13 +39,18 @@ impl StakeQos {
     pub fn new(pairs: Vec<String>) -> Self {
         let mut bindings = HashMap::new();
         for pair in pairs {
-            let Some((key, address)) = pair.split_once(':') else { continue };
+            let Some((key, address)) = pair.split_once(':') else {
+                continue;
+            };
             let (key, address) = (key.trim(), address.trim());
             if key.len() >= 16 && crate::crypto::is_valid_address(address) {
                 bindings.insert(key.to_string(), address.to_string());
             }
         }
-        StakeQos { bindings, cache: Mutex::new(None) }
+        StakeQos {
+            bindings,
+            cache: Mutex::new(None),
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -82,7 +87,9 @@ impl StakeQos {
             return 1.0;
         }
         let Some(cred) = credential else { return 1.0 };
-        let Some(address) = self.address_for(cred) else { return 1.0 };
+        let Some(address) = self.address_for(cred) else {
+            return 1.0;
+        };
         let total = self.total_staked(store);
         if total == 0 {
             return 1.0;
@@ -98,7 +105,9 @@ impl StakeQos {
     /// Stake share as a percentage, for reporting over RPC.
     pub fn share_pct(&self, store: &Store, credential: Option<&str>) -> f64 {
         let Some(cred) = credential else { return 0.0 };
-        let Some(address) = self.address_for(cred) else { return 0.0 };
+        let Some(address) = self.address_for(cred) else {
+            return 0.0;
+        };
         let total = self.total_staked(store);
         if total == 0 {
             return 0.0;
@@ -118,7 +127,10 @@ mod tests {
             "key-0123456789abcdef:not-an-address".into(),
             "no-separator".into(),
         ]);
-        assert!(qos.is_empty(), "a malformed binding must never grant priority");
+        assert!(
+            qos.is_empty(),
+            "a malformed binding must never grant priority"
+        );
     }
 
     #[test]

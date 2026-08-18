@@ -19,10 +19,28 @@ use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::io::Read;
 use std::net::{IpAddr, TcpListener, TcpStream, ToSocketAddrs};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const MAX_SYNC_BATCH: u64 = 200;
+/// Only one catch-up may run at a time. Concurrent syncs used to fetch
+/// overlapping ranges from different peers, so one thread's batch went stale the
+/// moment the other imported a block — surfacing as a bogus "parent hash
+/// mismatch" that then triggered a full replay from genesis.
+static SYNC_GATE: Mutex<()> = Mutex::new(());
+/// Unix seconds of the last genesis replay, so a node that keeps diverging
+/// cannot spin in a reset loop and never finish syncing.
+static LAST_RESET: AtomicU64 = AtomicU64::new(0);
+/// A full replay is expensive; never start another within this window.
+const RESET_COOLDOWN_SECS: u64 = 900;
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 /// Abuse limits for the gossip port: peers are few, messages are many.
 const P2P_MSGS_PER_SEC: f64 = 400.0;
 const P2P_BURST: f64 = 2_000.0;
@@ -151,7 +169,7 @@ fn connect(peer: &str) -> Result<TcpStream, String> {
 
 /// Sign and gossip a precommit for a block this node accepts as valid.
 pub fn vote_on(node: &Arc<Node>, p2p: &Arc<P2p>, block: &Block) {
-    if !node.is_bonded_validator() {
+    if !node.is_bonded_validator() || node.halted() {
         return;
     }
     let mut vote = Vote {
@@ -200,10 +218,17 @@ pub fn serve(node: Arc<Node>, p2p: Arc<P2p>) -> Result<(), String> {
         "[p2p] listening on {} ({} peers, encryption {})",
         p2p.listen,
         p2p.peers.len(),
-        if p2p.require_encryption { "required" } else { "preferred" }
+        if p2p.require_encryption {
+            "required"
+        } else {
+            "preferred"
+        }
     );
     if !p2p.allowed_ids.is_empty() {
-        println!("[p2p] allowlist active: {} node keys", p2p.allowed_ids.len());
+        println!(
+            "[p2p] allowlist active: {} node keys",
+            p2p.allowed_ids.len()
+        );
     }
     let limiter = Arc::new(RateLimiter::new(P2P_MSGS_PER_SEC, P2P_BURST));
     let conns = Arc::new(ConnGuard::new(P2P_MAX_LIVE_CONNS));
@@ -266,7 +291,10 @@ fn accept_channel(mut stream: TcpStream, p2p: &Arc<P2p>) -> Result<Channel, Stri
         stream.read_exact(&mut ei).map_err(|e| e.to_string())?;
         let ch = transport::handshake_responder(stream, &p2p.id, ei)?;
         if !p2p.id_allowed(ch.peer_id()) {
-            return Err(format!("rejected peer {:?}: not on allowlist", ch.peer_id()));
+            return Err(format!(
+                "rejected peer {:?}: not on allowlist",
+                ch.peer_id()
+            ));
         }
         return Ok(ch);
     }
@@ -296,7 +324,9 @@ fn handle_conn(
         }
     };
     // Sessions are long-lived; a peer may legitimately be quiet between blocks.
-    read_stream.set_read_timeout(Some(Duration::from_secs(120))).ok();
+    read_stream
+        .set_read_timeout(Some(Duration::from_secs(120)))
+        .ok();
     if let (Some(ip), false) = (ip, ch.is_encrypted()) {
         p2p.book.penalize(ip, COST_PLAINTEXT);
     }
@@ -304,7 +334,11 @@ fn handle_conn(
         // Sessions are short-lived per gossip message, so only announce a peer
         // identity the first time it is seen.
         if p2p.book.note_identity(ip, id) {
-            println!("[p2p] authenticated peer {} ({}…)", ip, &id[..8.min(id.len())]);
+            println!(
+                "[p2p] authenticated peer {} ({}…)",
+                ip,
+                &id[..8.min(id.len())]
+            );
         }
     }
     loop {
@@ -343,7 +377,11 @@ fn handle_msg(node: &Arc<Node>, p2p: &Arc<P2p>, msg: &Value, ip: Option<IpAddr>)
         })),
         "getblocks" => {
             let from = msg.get("from").and_then(|v| v.as_u64()).unwrap_or(0);
-            let limit = msg.get("limit").and_then(|v| v.as_u64()).unwrap_or(MAX_SYNC_BATCH).min(MAX_SYNC_BATCH);
+            let limit = msg
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(MAX_SYNC_BATCH)
+                .min(MAX_SYNC_BATCH);
             let tip = node.store.tip_height().unwrap_or(0);
             let mut blocks = Vec::new();
             let mut h = from;
@@ -397,7 +435,11 @@ fn handle_msg(node: &Arc<Node>, p2p: &Arc<P2p>, msg: &Value, ip: Option<IpAddr>)
             }
             match node.import_block(&block) {
                 Ok(true) => {
-                    println!("[sync] imported #{} from peer ({} txs)", block.height, block.transactions.len());
+                    println!(
+                        "[sync] imported #{} from peer ({} txs)",
+                        block.height,
+                        block.transactions.len()
+                    );
                     vote_on(node, p2p, &block);
                     p2p.broadcast(&json!({ "t": "block", "block": block }));
                 }
@@ -425,6 +467,11 @@ fn handle_msg(node: &Arc<Node>, p2p: &Arc<P2p>, msg: &Value, ip: Option<IpAddr>)
 
 /// Pull any blocks this node is missing from every peer, in order.
 pub fn sync_once(node: &Arc<Node>, p2p: &Arc<P2p>) {
+    // Skip rather than queue: another thread is already pulling the same range.
+    let _gate = match SYNC_GATE.try_lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
     for peer in &p2p.peers {
         let status = p2p.request(peer, &json!({ "t": "status" })).ok();
         let peer_height = status
@@ -432,11 +479,17 @@ pub fn sync_once(node: &Arc<Node>, p2p: &Arc<P2p>) {
             .and_then(|s| s.get("height"))
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
+        // Let block production know how far ahead the network is, so a lagging
+        // validator waits instead of forking off its own stale tip.
+        crate::types::note_peer_height(peer_height);
         let from = node.store.tip_height().unwrap_or(0) + 1;
         if peer_height + 1 < from {
             continue; // peer is behind us; nothing to pull
         }
-        let res = match p2p.request(peer, &json!({ "t": "getblocks", "from": from, "limit": MAX_SYNC_BATCH })) {
+        let res = match p2p.request(
+            peer,
+            &json!({ "t": "getblocks", "from": from, "limit": MAX_SYNC_BATCH }),
+        ) {
             Ok(v) => v,
             Err(_) => continue,
         };
@@ -456,7 +509,11 @@ pub fn sync_once(node: &Arc<Node>, p2p: &Arc<P2p>) {
                     // A parent mismatch means the two nodes forked. The longer
                     // chain wins; at equal length the lower block hash wins, so
                     // both sides pick the same branch without negotiating.
-                    if e.contains("parent hash mismatch") && should_adopt(node, &b, peer_height) {
+                    if e.contains("parent hash mismatch")
+                        && should_adopt(node, &b, peer_height)
+                        && now_secs().saturating_sub(LAST_RESET.load(Ordering::Relaxed))
+                            > RESET_COOLDOWN_SECS
+                    {
                         resolve_fork(node, p2p, peer, peer_height);
                     }
                     break;
@@ -484,19 +541,37 @@ fn should_adopt(node: &Arc<Node>, peer_block: &Block, peer_height: u64) -> bool 
 
 /// Adopt a peer's longer chain by rebuilding local state from genesis.
 fn resolve_fork(node: &Arc<Node>, p2p: &Arc<P2p>, peer: &str, peer_height: u64) {
+    // Never destroy local state on a peer's word. The claim has to be backed by
+    // a signed header at the claimed tip, and the peer's chain has to contain
+    // the history this node already finalized. A lying or eclipsing peer can
+    // otherwise force honest nodes to wipe their database on demand.
+    if let Err(e) = verify_peer_claim(node, p2p, peer, peer_height) {
+        eprintln!("[fork] refusing to follow {}: {}", peer, e);
+        if let Some(ip) = peer.split(':').next().and_then(|h| h.parse().ok()) {
+            p2p.book.penalize(ip, COST_BAD_BLOCK);
+        }
+        return;
+    }
     println!(
         "[fork] peer {} has the longer chain (#{} vs #{}), replaying from genesis",
         peer,
         peer_height,
         node.store.tip_height().unwrap_or(0)
     );
+    LAST_RESET.store(now_secs(), Ordering::Relaxed);
     if let Err(e) = node.reset_to_genesis(peer_height) {
         eprintln!("[fork] {}", e);
         return;
     }
     let mut next = 1u64;
-    while next <= peer_height {
-        let res = match p2p.request(peer, &json!({ "t": "getblocks", "from": next, "limit": MAX_SYNC_BATCH })) {
+    // The peer keeps producing while we replay, so follow its live tip instead
+    // of the height it reported when the fork was detected.
+    let mut target = peer_height;
+    while next <= target {
+        let res = match p2p.request(
+            peer,
+            &json!({ "t": "getblocks", "from": next, "limit": MAX_SYNC_BATCH }),
+        ) {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("[fork] fetch failed: {}", e);
@@ -508,22 +583,106 @@ fn resolve_fork(node: &Arc<Node>, p2p: &Arc<P2p>, peer: &str, peer_height: u64) 
             None => Vec::new(),
         };
         if blocks.is_empty() {
+            // Ask the peer where it is now; if it has advanced, keep going.
+            let live = p2p
+                .request(peer, &json!({ "t": "status" }))
+                .ok()
+                .and_then(|s| s.get("height").and_then(|v| v.as_u64()))
+                .unwrap_or(target);
+            if live > target {
+                target = live;
+                continue;
+            }
             break;
         }
+        let before = next;
         for b in &blocks {
             match node.import_block(b) {
                 Ok(_) => next = b.height + 1,
                 Err(e) => {
                     eprintln!("[fork] replay stopped at #{}: {}", b.height, e);
+                    // Keep every block already replayed. Normal in-order sync
+                    // resumes from the new tip on the next round instead of
+                    // discarding hundreds of thousands of blocks again.
+                    println!(
+                        "[fork] keeping progress at #{}",
+                        node.store.tip_height().unwrap_or(0)
+                    );
                     return;
                 }
             }
         }
+        if next == before {
+            break; // peer served only blocks we already have
+        }
     }
-    println!("[fork] resolved, now at #{}", node.store.tip_height().unwrap_or(0));
+    println!(
+        "[fork] resolved, now at #{}",
+        node.store.tip_height().unwrap_or(0)
+    );
     if let Some(b) = node.store.tip_height().and_then(|h| node.store.block(h)) {
         vote_on(node, p2p, &b);
     }
+}
+
+/// Fetch one block from a peer at an exact height.
+fn peer_block(p2p: &Arc<P2p>, peer: &str, height: u64) -> Option<Block> {
+    let res = p2p
+        .request(
+            peer,
+            &json!({ "t": "getblocks", "from": height, "limit": 1 }),
+        )
+        .ok()?;
+    let blocks: Vec<Block> = serde_json::from_value(res.get("blocks").cloned()?).ok()?;
+    blocks.into_iter().find(|b| b.height == height)
+}
+
+/// Authenticate a fork claim before any local state is discarded.
+fn verify_peer_claim(
+    node: &Arc<Node>,
+    p2p: &Arc<P2p>,
+    peer: &str,
+    peer_height: u64,
+) -> Result<(), String> {
+    let tip = peer_block(p2p, peer, peer_height).ok_or("peer cannot serve its own claimed tip")?;
+    if tip.height != peer_height {
+        return Err("peer served the wrong height".into());
+    }
+    if tip.hash != tip.compute_hash() {
+        return Err("peer tip hash does not match its header".into());
+    }
+    if !tip.verify_producer() {
+        return Err("peer tip carries no valid producer signature".into());
+    }
+    // The fork must build on the history we already consider irreversible.
+    // The finalized marker survives a reset-to-genesis as a safety floor, so it
+    // can sit above the local tip while a replay is still in progress. Compare
+    // at the highest height we can actually back with a local block, otherwise
+    // an interrupted replay leaves the node permanently unable to follow anyone.
+    let mut check = node
+        .store
+        .finalized_height()
+        .min(node.store.tip_height().unwrap_or(0));
+    while check > 0 && node.store.block(check).is_none() {
+        check -= 1;
+    }
+    if check > 0 {
+        let ours = node
+            .store
+            .block(check)
+            .ok_or("local finalized block missing")?;
+        let theirs =
+            peer_block(p2p, peer, check).ok_or("peer cannot serve our finalized height")?;
+        if theirs.hash != ours.hash {
+            return Err(format!(
+                "peer chain diverges below finalized height {} (ours {} theirs {})",
+                check,
+                &ours.hash[..8.min(ours.hash.len())],
+                &theirs.hash[..8.min(theirs.hash.len())]
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Background catch-up loop, so a node that was offline rejoins on its own.
