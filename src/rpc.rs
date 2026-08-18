@@ -246,6 +246,13 @@ pub fn dispatch_metered(
     cfg: &RpcConfig,
     tier: Tier,
 ) -> Result<Value, String> {
+    // Second, independent authorization gate. The HTTP handler already refuses
+    // privileged methods for non-admin callers, but any other entry point
+    // (websocket, batch, an internal caller) reaches dispatch directly, so the
+    // rule is enforced here too and fails closed.
+    if crate::rpcauth::PRIVILEGED_METHODS.contains(&method) && tier != Tier::Admin {
+        return Err("admin key required".into());
+    }
     match method {
         "inaz_sendTransaction" => {
             let raw = params.get("tx").cloned().unwrap_or_else(|| params.clone());

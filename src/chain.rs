@@ -478,13 +478,22 @@ impl Node {
         // Unstake moves coins out of `staked`, so only the fee comes from the
         // balance. Token transactions move token units, never INAZ, except the
         // one-off creation fee.
+        //
+        // Every addition here is saturating. These are attacker-chosen u128
+        // fields: `amount = u128::MAX` with any fee overflows a plain `+`, and
+        // in a debug build that is a panic — i.e. a one-transaction remote kill
+        // of every node that sees it. Saturating keeps the sum above any real
+        // balance, so the transaction is simply rejected as unaffordable.
         let required = match tx.kind {
             TxKind::Unstake => tx.fee,
             TxKind::ReportEquivocation | TxKind::Unjail => tx.fee,
-            TxKind::CreateToken => tx.fee + TOKEN_CREATION_FEE,
+            TxKind::CreateToken => tx.fee.saturating_add(TOKEN_CREATION_FEE),
             TxKind::MintToken | TxKind::TokenTransfer | TxKind::BurnToken => tx.fee,
-            TxKind::DeployContract => tx.fee + DEPLOY_FEE + tx.amount,
-            _ => tx.amount + tx.fee,
+            TxKind::DeployContract => tx
+                .fee
+                .saturating_add(DEPLOY_FEE)
+                .saturating_add(tx.amount),
+            _ => tx.amount.saturating_add(tx.fee),
         };
         if acct.balance < required {
             return Err("insufficient balance".into());
@@ -548,13 +557,18 @@ impl Node {
         if tx.nonce != from.nonce {
             return Err("stale nonce".into());
         }
+        // Saturating for the same reason as in `admit`: these are untrusted
+        // u128 fields, and an overflow panic here would abort a block import.
         let debit = match tx.kind {
             TxKind::Unstake => tx.fee,
             TxKind::ReportEquivocation | TxKind::Unjail => tx.fee,
-            TxKind::CreateToken => tx.fee + TOKEN_CREATION_FEE,
+            TxKind::CreateToken => tx.fee.saturating_add(TOKEN_CREATION_FEE),
             TxKind::MintToken | TxKind::TokenTransfer | TxKind::BurnToken => tx.fee,
-            TxKind::DeployContract => tx.fee + DEPLOY_FEE + tx.amount,
-            _ => tx.amount + tx.fee,
+            TxKind::DeployContract => tx
+                .fee
+                .saturating_add(DEPLOY_FEE)
+                .saturating_add(tx.amount),
+            _ => tx.amount.saturating_add(tx.fee),
         };
         if from.balance < debit {
             return Err("insufficient balance".into());
@@ -717,8 +731,8 @@ impl Node {
         // The creation fee joins the block's fee pool, so it is paid out to the
         // validator set rather than vanishing.
         let collected = match tx.kind {
-            TxKind::CreateToken => tx.fee + TOKEN_CREATION_FEE,
-            TxKind::DeployContract => tx.fee + DEPLOY_FEE,
+            TxKind::CreateToken => tx.fee.saturating_add(TOKEN_CREATION_FEE),
+            TxKind::DeployContract => tx.fee.saturating_add(DEPLOY_FEE),
             _ => tx.fee,
         };
         Ok(collected)
@@ -1190,6 +1204,49 @@ impl Node {
             &hash[..8]
         );
         Ok(hash)
+    }
+
+    /// Leave a downtime jail without operator action.
+    ///
+    /// A restart, a snapshot restore or a slow resync is enough to miss the
+    /// jail streak, and a jailed validator is excluded from the active set —
+    /// on a small set that quietly collapses block production onto whoever is
+    /// left. The node therefore submits its own `Unjail` as soon as the jail
+    /// period has expired. Consensus rules are unchanged: the transaction is
+    /// validated like any other, and a tombstoned key can never come back.
+    pub fn try_self_unjail(&self) -> Option<String> {
+        let address = self.producer.address();
+        let acct = self.store.account(&address);
+        if acct.penalties.tombstoned || acct.penalties.jailed_until == 0 {
+            return None;
+        }
+        let height = self.store.tip_height().unwrap_or(0) + 1;
+        if acct.penalties.jailed_until > height {
+            return None;
+        }
+        let mut tx = Transaction {
+            kind: TxKind::Unjail,
+            from_pubkey: self.producer.pubkey_hex(),
+            to: address.clone(),
+            amount: 0,
+            fee: self.fee_floor().max(MIN_FEE),
+            nonce: self.pending_nonce(&address),
+            chain_id: self.genesis.chain_id,
+            payload: None,
+            signature: String::new(),
+        };
+        tx.signature = self.producer.sign_hex(&tx.canonical_signing_bytes());
+        match self.accept_tx(tx.clone()) {
+            Ok(hash) => {
+                self.gossip_tx(&tx);
+                println!("[slash] self-unjail submitted at #{} -> {}", height, &hash[..8]);
+                Some(hash)
+            }
+            Err(e) => {
+                eprintln!("[slash] self-unjail refused: {}", e);
+                None
+            }
+        }
     }
 
     /// A peer sent a block for a height we already sealed with a different hash.

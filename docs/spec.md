@@ -121,7 +121,23 @@ encryption and pin an allowlist of node keys. Per-IP token-bucket rate limits,
 global and per-IP connection caps, bounded frame sizes, and peer reputation
 scoring with temporary bans are enforced on every inbound connection.
 
-## 10. Known gaps (not yet specified or built)
+## 10. Arithmetic and resource safety
+
+All balance, fee and stake arithmetic over attacker-controlled `u128` fields is
+saturating (`chain.rs`). A transaction whose `amount + fee` would overflow is
+rejected as unaffordable rather than aborting the process; an overflow panic in
+admission or import is a consensus-halting denial of service, so plain `+` on
+untrusted amounts is forbidden in this codebase.
+
+Operator RPC methods (`inaz_rpcLimits`, `inaz_halt`, `inaz_resume`,
+`inaz_prune`) require the admin tier and are checked at both the HTTP layer and
+inside `dispatch_metered`, so no entry point can reach them anonymously. A node
+with no admin key configured refuses them outright.
+
+Test coverage for every rule in this document is enumerated in
+[testing.md](testing.md).
+
+## 11. Known gaps (not yet specified or built)
 
 * One client implementation; no independent re-implementation of this spec.
 * No external audit, no funded bug bounty.

@@ -36,8 +36,23 @@ staking coin — nobody needs to hold another chain's token to validate.
 | Run a node in one command | [`install-validator.sh`](https://github.com/inazuma-network/inazuma-validator/blob/main/scripts/install-validator.sh) |
 | Build an app against the chain | [docs/rpc.md](docs/rpc.md) |
 | Understand how it works internally | [docs/architecture.md](docs/architecture.md) |
+| Read the consensus specification | [docs/spec.md](docs/spec.md) |
+| See what is tested, and what is not | [docs/testing.md](docs/testing.md) |
 | Report a vulnerability | [SECURITY.md](SECURITY.md) |
 | Contribute code | [CONTRIBUTING.md](CONTRIBUTING.md) |
+
+## Testing and hardening
+
+`cargo test` runs **155 tests** — unit, adversarial, property/fuzz and an
+end-to-end conformance suite covering consensus, execution, networking, mempool,
+state, contracts, RPC, load, security and upgrade activation. Every conformance
+test drives a real node from genesis rather than a mock.
+
+Full breakdown, the bugs the suite found, the operational tests run against the
+live devnet, and an honest list of what is still unproven:
+**[docs/testing.md](docs/testing.md)**.
+
+There is no external audit yet. Treat the chain as pre-testnet software.
 
 ## Ecosystem repositories
 

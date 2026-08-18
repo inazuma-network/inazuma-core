@@ -10,6 +10,7 @@
 #[cfg(test)]
 mod battletest;
 mod chain;
+mod conformance;
 mod consensus;
 mod contracts;
 mod crypto;
@@ -468,6 +469,15 @@ fn run() -> Result<(), String> {
                     "HALTED       {} — serving reads only, run `inazuma resume` to clear",
                     reason
                 );
+            }
+
+            // Rejoin the active set on our own once a downtime jail expires.
+            {
+                let unjail_node = Arc::clone(&node);
+                std::thread::spawn(move || loop {
+                    std::thread::sleep(std::time::Duration::from_secs(30));
+                    unjail_node.try_self_unjail();
+                });
             }
 
             loop {
