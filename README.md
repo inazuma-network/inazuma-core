@@ -133,7 +133,10 @@ inazuma stake   --key <SECRET> --amount 1000
 inazuma unstake --key <SECRET> --amount 1000
 inazuma balance --address <ADDRESS>
 inazuma validators                        # active set, stake shares, next leader
-inazuma status                            # height, sync state, missed-slot streak
+inazuma status                            # height, finalized, peers, mempool, sync state
+inazuma status --rpc https://rpc.inazuma.network   # query the public network over HTTPS
+inazuma wallet-new                        # create + save a wallet in ~/.inazuma
+inazuma wallet                            # saved address, balance, stake, rewards
 inazuma slashing                          # params, jail state, slash history
 inazuma report   --evidence ./evidence.json
 inazuma unjail  --key <SECRET>

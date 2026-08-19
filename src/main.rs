@@ -793,6 +793,39 @@ fn run() -> Result<(), String> {
             Ok(())
         }
 
+        "status" => {
+            let rpc_url = flags
+                .get("rpc")
+                .cloned()
+                .unwrap_or_else(|| "http://127.0.0.1:9933".into());
+            let res = rpc_call(&rpc_url, "inaz_nodeStatus", serde_json::json!({}))?;
+            let height = res["height"].as_u64().unwrap_or(0);
+            let finalized = res["finalizedHeight"].as_u64().unwrap_or(0);
+            let syncing = res["syncing"].as_bool().unwrap_or(false);
+            println!("rpc            {}", rpc_url);
+            println!("chain id       {}", res["chainId"]);
+            println!("role           {}", res["role"].as_str().unwrap_or("node"));
+            println!("height         {}", height);
+            println!("finalized      {}", finalized);
+            println!("peers          {}", res["peers"]);
+            println!("mempool        {}", res["mempool"]);
+            println!(
+                "sync           {}",
+                if syncing { "syncing — do not stake yet" } else { "in sync" }
+            );
+            if let Ok(net) = rpc_call(
+                "https://rpc.inazuma.network",
+                "inaz_nodeStatus",
+                serde_json::json!({}),
+            ) {
+                let tip = net["height"].as_u64().unwrap_or(0);
+                if tip > 0 && !rpc_url.contains("rpc.inazuma.network") {
+                    println!("network tip    {} (behind by {})", tip, tip.saturating_sub(height));
+                }
+            }
+            Ok(())
+        }
+
         "validators" => {
             let rpc_url = flags
                 .get("rpc")
@@ -1667,6 +1700,7 @@ fn run() -> Result<(), String> {
             println!("  send    --key HEX --to ADDR --amount N    send INAZ");
             println!("  stake   --key HEX --amount N              stake INAZ");
             println!("  unstake --key HEX --amount N              unstake INAZ");
+            println!("  status  [--rpc URL]                       node height, peers and sync state");
             println!("  validators                                show the validator set");
             println!("  balance --address ADDR                    read an account");
             println!("  token-create --key HEX --symbol S --name N --supply N [--decimals 9] [--mintable true]");
