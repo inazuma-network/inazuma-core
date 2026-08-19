@@ -110,6 +110,10 @@ inazuma run  --data ./data --genesis ./genesis.json \
   --key <SECRET_HEX> --rpc 127.0.0.1:9933
 ```
 
+The node logs in the Ethereum-client format operators already know
+(`INFO [MM-DD|HH:MM:SS.mmm] Message key=value`), so `grep`, journald and log
+shippers work unchanged. `--ui hud` switches to the animated Inazuma HUD.
+
 Join the public network by adding `--peers rpc.inazuma.network:9944`, wait until
 `inaz_nodeStatus` reports you in sync, then bond:
 

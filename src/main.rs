@@ -19,6 +19,7 @@ mod fees;
 mod fuzz;
 mod journal;
 mod limits;
+mod log;
 mod mempool;
 mod p2p;
 mod qos;
@@ -33,6 +34,7 @@ mod state;
 mod tokens;
 mod transport;
 mod types;
+mod ui;
 mod ws;
 
 use chain::Node;
@@ -313,66 +315,170 @@ fn run() -> Result<(), String> {
                 );
             }
 
-            println!("=== Inazuma node ===");
-            println!("chain id     {}", node.genesis.chain_id);
-            println!("producer     {}", node.producer.address());
-            println!("node key     {}", node_id.pubkey_hex());
-            println!(
-                "p2p security encrypted INSC1 ({}), allowlist {}",
-                if network.require_encryption {
-                    "required"
-                } else {
-                    "preferred"
-                },
-                if network.allowed_ids.is_empty() {
-                    "off".to_string()
-                } else {
-                    format!("{} keys", network.allowed_ids.len())
+            let me = node.producer.address();
+            let my_stake = node.store.account(&me).staked;
+            // Everything below reads the LOCAL database. On a fresh data dir that
+            // is still at genesis, so stake/validator counts are zeros until the
+            // node has replayed the chain. Say so instead of printing a stale 0
+            // as if it were the network truth.
+            let local_height = node.store.tip_height().unwrap_or(0);
+            let net_height = types::best_peer_height();
+            let behind = net_height > local_height + 2;
+            let pending = if behind {
+                format!(" — local view at #{}, syncing to #{}", local_height, net_height)
+            } else {
+                String::new()
+            };
+            // Output style. Default is the Ethereum-client log format every
+            // operator already knows (geth/lighthouse style); the animated
+            // Inazuma HUD stays available with `--ui hud`.
+            let hud = flags
+                .get("ui")
+                .map(|v| v == "hud")
+                .unwrap_or_else(|| std::env::var("INAZ_UI").ok().as_deref() == Some("hud"));
+            if !hud {
+                log::welcome(env!("CARGO_PKG_VERSION"), node.genesis.chain_id, &data, &me);
+                log::info(
+                    "Initialised chain configuration",
+                    &[
+                        ("chain", format!("inazuma-{}", node.genesis.chain_id)),
+                        ("blocktime", format!("{}ms", block_time)),
+                        (
+                            "engine",
+                            format!("pos (min stake {} INAZ)", format_inaz(types::MIN_STAKE)),
+                        ),
+                    ],
+                );
+                log::info(
+                    "Loaded local state database",
+                    &[
+                        ("height", log::num(local_height)),
+                        ("finalized", log::num(node.store.finalized_height())),
+                        ("root", log::short(&node.store.merkle_root())),
+                    ],
+                );
+                log::info(
+                    "Started P2P networking",
+                    &[
+                        ("self", log::short(&node_id.pubkey_hex())),
+                        ("peers", network.peers.len().to_string()),
+                        (
+                            "transport",
+                            format!(
+                                "INSC1-{}",
+                                if network.require_encryption { "required" } else { "preferred" }
+                            ),
+                        ),
+                    ],
+                );
+                log::info(
+                    "HTTP server started",
+                    &[("endpoint", format!("http://{}", rpc_addr))],
+                );
+                if !ws_addr.is_empty() {
+                    log::info(
+                        "WebSocket server started",
+                        &[("endpoint", format!("ws://{}", ws_addr))],
+                    );
                 }
-            );
-            println!("block time   {} ms", block_time);
-            println!("height       {}", node.store.tip_height().unwrap_or(0));
-            println!(
-                "supply       {} INAZ",
-                format_inaz(node.store.total_supply())
-            );
-            println!(
-                "staked       {} INAZ across {} validators",
-                format_inaz(node.store.total_staked()),
-                node.validators().len()
-            );
-            println!(
-                "min stake    {} INAZ to validate",
-                format_inaz(types::MIN_STAKE)
-            );
-            println!(
-                "mode         {}",
-                if replica {
-                    "replica (serving only)"
-                } else if node.solo() {
-                    "solo (no peers)"
-                } else {
-                    "networked"
+                log::info(
+                    "Validator account ready",
+                    &[
+                        ("address", me.clone()),
+                        ("stake", format!("{} INAZ", format_inaz(my_stake))),
+                        (
+                            "state",
+                            if my_stake >= types::MIN_STAKE {
+                                "bonded".to_string()
+                            } else {
+                                format!("unbonded (stake {} INAZ to validate)", format_inaz(types::MIN_STAKE))
+                            },
+                        ),
+                    ],
+                );
+                if behind {
+                    log::info(
+                        "Starting chain synchronisation",
+                        &[
+                            ("from", log::num(local_height)),
+                            ("target", log::num(net_height)),
+                        ],
+                    );
                 }
+                log::info(
+                    "Validator dashboard",
+                    &[("url", format!("{}?node={}", ui::DASHBOARD, me))],
+                );
+            }
+            if hud {
+            ui::banner();
+            ui::panel(
+                "node",
+                &[
+                    ("chain id".into(), format!("{} (Inazuma)", node.genesis.chain_id)),
+                    ("validator".into(), me.clone()),
+                    ("node key".into(), node_id.pubkey_hex()),
+                    (
+                        "p2p".into(),
+                        format!(
+                            "INSC1 encrypted ({}), allowlist {}",
+                            if network.require_encryption { "required" } else { "preferred" },
+                            if network.allowed_ids.is_empty() {
+                                "off".to_string()
+                            } else {
+                                format!("{} keys", network.allowed_ids.len())
+                            }
+                        ),
+                    ),
+                    ("block time".into(), format!("{} ms", block_time)),
+                    (
+                        "mode".into(),
+                        if replica {
+                            "replica (serving only)".into()
+                        } else if node.solo() {
+                            "solo (no peers yet)".to_string()
+                        } else {
+                            "networked".to_string()
+                        },
+                    ),
+                    (
+                        "your stake".into(),
+                        format!(
+                            "{} INAZ (min {} to validate){}",
+                            format_inaz(my_stake),
+                            format_inaz(types::MIN_STAKE),
+                            pending
+                        ),
+                    ),
+                    (
+                        "network".into(),
+                        format!(
+                            "{} INAZ staked across {} validators{}",
+                            format_inaz(node.store.total_staked()),
+                            node.validators().len(),
+                            pending
+                        ),
+                    ),
+                    ("supply".into(), format!("{} INAZ", format_inaz(node.store.total_supply()))),
+                    ("rpc".into(), format!("http://{}", rpc_addr)),
+                    (
+                        "ws".into(),
+                        if ws_addr.is_empty() {
+                            "disabled".to_string()
+                        } else {
+                            format!("ws://{}", ws_addr)
+                        },
+                    ),
+                    (
+                        "state root".into(),
+                        format!("merkle from height {}", state::STATE_ROOT_V2_ACTIVATION_HEIGHT),
+                    ),
+                ],
             );
-            println!(
-                "ws           {}",
-                if ws_addr.is_empty() {
-                    "disabled".to_string()
-                } else {
-                    format!("ws://{}", ws_addr)
-                }
-            );
-            println!("finalized    height {}", node.store.finalized_height());
-            println!(
-                "base fee     {} rai (floor {} rai)",
-                node.base_fee(),
-                node.fee_floor()
-            );
-            println!(
-                "state root   merkle from height {}",
-                state::STATE_ROOT_V2_ACTIVATION_HEIGHT
-            );
+            ui::dashboard_link(&me);
+            ui::next_steps(&me, my_stake >= types::MIN_STAKE);
+            ui::commands(my_stake >= types::MIN_STAKE);
+            }
 
             let rpc_node = Arc::clone(&node);
             // RPC access control: keys from flags or env, comma separated.
@@ -480,13 +586,37 @@ fn run() -> Result<(), String> {
                 });
             }
 
+            let mut tick = 0usize;
+            let mut last_beat = std::time::Instant::now();
+            // Empty blocks are logged sparsely: 400ms slots would otherwise bury
+            // real events, exactly like geth does not log every idle sealing.
+            let mut last_empty_log = std::time::Instant::now()
+                - std::time::Duration::from_secs(30);
+            let mut synced_summary_shown = false;
             loop {
                 let started = std::time::Instant::now();
                 match node.produce_block() {
                     Ok(Some(b)) => {
-                        if !b.transactions.is_empty() {
+                        let empty = b.transactions.is_empty();
+                        let show_empty = last_empty_log.elapsed()
+                            >= std::time::Duration::from_secs(10);
+                        if !hud && (!empty || show_empty) {
+                            if empty {
+                                last_empty_log = std::time::Instant::now();
+                            }
+                            log::info(
+                                if empty { "Sealed new block" } else { "Imported new chain segment" },
+                                &[
+                                    ("number", log::num(b.height)),
+                                    ("hash", log::short(&b.hash)),
+                                    ("txs", b.transactions.len().to_string()),
+                                    ("peers", network.peers.len().to_string()),
+                                    ("elapsed", format!("{}ms", started.elapsed().as_millis())),
+                                ],
+                            );
+                        } else if !b.transactions.is_empty() {
                             println!(
-                                "[block] #{} txs={} hash={}",
+                                "\r\x1b[2K[block] #{} txs={} hash={}",
                                 b.height,
                                 b.transactions.len(),
                                 &b.hash[..16]
@@ -496,7 +626,142 @@ fn run() -> Result<(), String> {
                         p2p::vote_on(&node, &network, &b);
                     }
                     Ok(None) => { /* another validator's slot */ }
-                    Err(e) => eprintln!("[block] error: {}", e),
+                    Err(e) => {
+                        if hud {
+                            eprintln!("\r\x1b[2K[block] error: {}", e);
+                        } else {
+                            log::error("Block production failed", &[("err", e.to_string())]);
+                        }
+                    }
+                }
+                // Live one-line status so an operator can tell at a glance whether
+                // the node is syncing, validating or jailed.
+                let beat_every = if hud { 1500 } else { 8000 };
+                if last_beat.elapsed() >= std::time::Duration::from_millis(beat_every) {
+                    last_beat = std::time::Instant::now();
+                    tick += 1;
+                    let height = node.store.tip_height().unwrap_or(0);
+                    let v = node.validators().into_iter().find(|v| v.address == me);
+                    let acct = node.store.account(&me);
+                    let beat = ui::Beat {
+                        height,
+                        target: types::best_peer_height(),
+                        peers: network.peers.len(),
+                        finalized: node.store.finalized_height(),
+                        staked: acct.staked,
+                        validating: v.as_ref().map(|v| v.jailed_until == 0).unwrap_or(false),
+                        jailed: v.as_ref().map(|v| v.jailed_until > height).unwrap_or(false),
+                    };
+                    if hud {
+                        ui::heartbeat(tick, &beat, &format!("{} INAZ", format_inaz(acct.staked)));
+                    } else if beat.peers == 0 && !node.solo() {
+                        log::warn("Looking for peers", &[("peercount", "0".to_string())]);
+                    } else if beat.target > height + 2 {
+                        log::info(
+                            "Syncing chain segment",
+                            &[
+                                ("number", log::num(height)),
+                                ("target", log::num(beat.target)),
+                                (
+                                    "progress",
+                                    format!(
+                                        "{:.2}%",
+                                        (height as f64 / beat.target.max(1) as f64) * 100.0
+                                    ),
+                                ),
+                                ("peers", beat.peers.to_string()),
+                            ],
+                        );
+                    } else {
+                        log::info(
+                            "Chain head updated",
+                            &[
+                                ("number", log::num(height)),
+                                ("finalized", log::num(beat.finalized)),
+                                ("peers", beat.peers.to_string()),
+                                ("stake", format!("{} INAZ", format_inaz(acct.staked))),
+                                (
+                                    "role",
+                                    if beat.jailed {
+                                        "jailed".to_string()
+                                    } else if beat.validating {
+                                        "validator".to_string()
+                                    } else {
+                                        "full".to_string()
+                                    },
+                                ),
+                            ],
+                        );
+                    }
+                    // Once the local view has caught up, reprint the numbers that
+                    // were still zero/stale at boot so the operator sees the real
+                    // stake and validator set without restarting the node.
+                    let caught_up = beat.target <= height + 2;
+                    if caught_up && !synced_summary_shown {
+                        synced_summary_shown = true;
+                        if !hud {
+                            log::info(
+                                "Chain synchronisation finished",
+                                &[
+                                    ("height", log::num(height)),
+                                    (
+                                        "validators",
+                                        node.validators().len().to_string(),
+                                    ),
+                                    (
+                                        "netstake",
+                                        format!("{} INAZ", format_inaz(node.store.total_staked())),
+                                    ),
+                                    (
+                                        "you",
+                                        if beat.validating {
+                                            "producing blocks".to_string()
+                                        } else if acct.staked >= types::MIN_STAKE {
+                                            "joining active set".to_string()
+                                        } else {
+                                            "not staked".to_string()
+                                        },
+                                    ),
+                                ],
+                            );
+                        } else {
+                        ui::panel(
+                            "synced",
+                            &[
+                                ("height".into(), format!("#{} (finalized #{})", height, beat.finalized)),
+                                (
+                                    "your stake".into(),
+                                    format!(
+                                        "{} INAZ (min {} to validate)",
+                                        format_inaz(acct.staked),
+                                        format_inaz(types::MIN_STAKE)
+                                    ),
+                                ),
+                                (
+                                    "network".into(),
+                                    format!(
+                                        "{} INAZ staked across {} validators",
+                                        format_inaz(node.store.total_staked()),
+                                        node.validators().len()
+                                    ),
+                                ),
+                                (
+                                    "status".into(),
+                                    if beat.validating {
+                                        "validating — producing blocks".into()
+                                    } else if acct.staked >= types::MIN_STAKE {
+                                        "staked, joining the active set".to_string()
+                                    } else {
+                                        format!(
+                                            "not staked yet — run: inazuma stake --amount {}",
+                                            format_inaz(types::MIN_STAKE)
+                                        )
+                                    },
+                                ),
+                            ],
+                        );
+                        }
+                    }
                 }
                 let elapsed = started.elapsed().as_millis() as u64;
                 if elapsed < block_time {
@@ -725,12 +990,189 @@ fn run() -> Result<(), String> {
             Ok(())
         }
 
+        // ---- wallet: create, import, inspect. Keeps the operator out of shell
+        // quoting hell by owning ~/.inazuma/validator.env itself.
+        "wallet-new" | "wallet-import" | "wallet" => {
+            let path = wallet_path();
+            match cmd.as_str() {
+                "wallet-new" => {
+                    if wallet_secret().is_ok() && !flags.contains_key("force") {
+                        return Err(format!(
+                            "{} already holds a wallet. Pass --force to overwrite (funds are lost if you have no backup)",
+                            path
+                        ));
+                    }
+                    let kp = Keypair::generate();
+                    write_wallet(&kp)?;
+                    ui::banner();
+                    ui::panel(
+                        "new wallet",
+                        &[
+                            ("address".into(), kp.address()),
+                            ("saved to".into(), path.clone()),
+                            ("backup".into(), "print the secret with: inazuma wallet --reveal".into()),
+                        ],
+                    );
+                    println!("\nFund it, then run `inazuma stake --amount 1000`.");
+                    println!("Faucet: https://inazuma.network/faucet");
+                    Ok(())
+                }
+                "wallet-import" => {
+                    let kp = Keypair::from_secret_hex(
+                        flags.get("key").ok_or("--key <64 hex chars> required")?,
+                    )?;
+                    write_wallet(&kp)?;
+                    println!("imported {} -> {}", kp.address(), path);
+                    Ok(())
+                }
+                _ => {
+                    let kp = Keypair::from_secret_hex(&wallet_secret()?)?;
+                    let rpc_url = flags
+                        .get("rpc")
+                        .cloned()
+                        .unwrap_or_else(|| "http://127.0.0.1:9933".into());
+                    let mut rows = vec![
+                        ("address".to_string(), kp.address()),
+                        ("key file".to_string(), path.clone()),
+                    ];
+                    let mut staked_now: f64 = 0.0;
+                    let mut online = false;
+                    if let Ok(acct) = rpc_call(
+                        &rpc_url,
+                        "inaz_getAccount",
+                        serde_json::json!({ "address": kp.address() }),
+                    ) {
+                        online = true;
+                        rows.push((
+                            "balance".into(),
+                            format!(
+                                "{} INAZ",
+                                acct["balanceInaz"]
+                                    .as_str()
+                                    .or_else(|| acct["balanceFormatted"].as_str())
+                                    .unwrap_or("?")
+                            ),
+                        ));
+                        rows.push((
+                            "staked".into(),
+                            format!(
+                                "{} INAZ",
+                                acct["stakedInaz"]
+                                    .as_str()
+                                    .or_else(|| acct["stakedFormatted"].as_str())
+                                    .unwrap_or("?")
+                            ),
+                        ));
+                        staked_now = acct["stakedInaz"]
+                            .as_str()
+                            .or_else(|| acct["stakedFormatted"].as_str())
+                            .and_then(|s| s.replace(',', "").parse::<f64>().ok())
+                            .unwrap_or(0.0);
+                    } else {
+                        rows.push(("node".into(), format!("offline at {}", rpc_url)));
+                    }
+                    if flags.contains_key("reveal") {
+                        rows.push(("secret".into(), kp.secret_hex()));
+                    }
+                    ui::panel("wallet", &rows);
+                    // At-a-glance table: is my node usable right now?
+                    ui::status_table(&[
+                        ui::StatusRow {
+                            label: "local node",
+                            value: if online {
+                                format!("reachable at {}", rpc_url)
+                            } else {
+                                format!("unreachable at {}", rpc_url)
+                            },
+                            good: Some(online),
+                        },
+                        ui::StatusRow {
+                            label: "validating",
+                            value: if staked_now >= 1000.0 {
+                                "yes — stake meets the 1000 INAZ minimum".into()
+                            } else {
+                                "no — stake at least 1000 INAZ".into()
+                            },
+                            good: Some(staked_now >= 1000.0),
+                        },
+                    ]);
+                    ui::dashboard_link(&kp.address());
+                    ui::commands(staked_now >= 1000.0);
+                    Ok(())
+                }
+            }
+        }
+
+        // Leave the validator set: unbond the whole stake in one call.
+        "exit" => {
+            let rpc_url = flags
+                .get("rpc")
+                .cloned()
+                .unwrap_or_else(|| "http://127.0.0.1:9933".into());
+            let kp = Keypair::from_secret_hex(
+                &flags
+                    .get("key")
+                    .filter(|k| !k.is_empty())
+                    .cloned()
+                    .map(Ok)
+                    .unwrap_or_else(wallet_secret)?,
+            )?;
+            let acct = rpc_call(
+                &rpc_url,
+                "inaz_getAccount",
+                serde_json::json!({ "address": kp.address() }),
+            )?;
+            let staked: u128 = acct["staked"]
+                .as_u64()
+                .map(|v| v as u128)
+                .or_else(|| acct["staked"].as_str().and_then(|s| s.parse().ok()))
+                .unwrap_or(0);
+            if staked == 0 {
+                return Err("nothing staked on this account".into());
+            }
+            let nonce = acct["pendingNonce"]
+                .as_u64()
+                .or_else(|| acct["nonce"].as_u64())
+                .unwrap_or(0);
+            let mut tx = Transaction {
+                kind: TxKind::Unstake,
+                from_pubkey: kp.pubkey_hex(),
+                to: kp.address(),
+                amount: staked,
+                fee: MIN_FEE,
+                nonce,
+                chain_id: CHAIN_ID,
+                payload: None,
+                signature: String::new(),
+            };
+            tx.signature = kp.sign_hex(&tx.signing_bytes());
+            let res = rpc_call(
+                &rpc_url,
+                "inaz_sendTransaction",
+                serde_json::json!({ "tx": tx }),
+            )?;
+            println!(
+                "exit submitted: {} INAZ unbonding ({})",
+                format_inaz(staked),
+                res["hash"].as_str().unwrap_or("?")
+            );
+            println!("Keep the node running until the unbonding period ends, or you can be jailed.");
+            Ok(())
+        }
+
         "send" | "stake" | "unstake" => {
             let rpc_url = flags
                 .get("rpc")
                 .cloned()
                 .unwrap_or_else(|| "http://127.0.0.1:9933".into());
-            let kp = Keypair::from_secret_hex(flags.get("key").ok_or("--key required")?)?;
+            let kp = Keypair::from_secret_hex(
+                &flags
+                    .get("key")
+                    .filter(|k| !k.is_empty())
+                    .cloned()
+                    .map(Ok)
+                    .unwrap_or_else(wallet_secret)?,
+            )?;
             let amount = parse_inaz(flags.get("amount").ok_or("--amount required")?)?;
             let to = match cmd.as_str() {
                 "send" => flags.get("to").ok_or("--to required")?.clone(),
@@ -1212,7 +1654,12 @@ fn run() -> Result<(), String> {
         }
 
         _ => {
+            ui::banner();
             println!("Inazuma node (chain id {})\n", CHAIN_ID);
+            println!("  wallet-new                                create + save a validator wallet");
+            println!("  wallet-import --key HEX                   import an existing secret key");
+            println!("  wallet [--reveal]                         show address, balance and stake");
+            println!("  exit                                      unbond everything and leave the set");
             println!("  keygen                                    create a new INAZ keypair");
             println!("  init    --data DIR --genesis FILE         seal genesis block 0");
             println!("  run     --data DIR --key HEX --rpc ADDR   run the node + JSON-RPC");
@@ -1245,6 +1692,9 @@ fn producer_key(flags: &HashMap<String, String>, data: &str) -> Result<Keypair, 
     if let Some(k) = flags.get("key").filter(|k| !k.is_empty()) {
         return Keypair::from_secret_hex(k);
     }
+    if let Ok(k) = wallet_secret() {
+        return Keypair::from_secret_hex(&k);
+    }
     if let Ok(k) = std::env::var("INAZUMA_KEY") {
         if !k.trim().is_empty() {
             return Keypair::from_secret_hex(&k);
@@ -1260,37 +1710,93 @@ fn producer_key(flags: &HashMap<String, String>, data: &str) -> Result<Keypair, 
     Ok(kp)
 }
 
-/// Minimal JSON-RPC client over raw HTTP, so the CLI needs no HTTP dependency.
+/// Where the operator wallet lives. One file, one format, owned by the CLI.
+fn wallet_path() -> String {
+    if let Ok(p) = std::env::var("INAZ_WALLET") {
+        return p;
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    format!("{}/.inazuma/validator.env", home)
+}
+
+/// Reads the wallet secret from INAZ_KEY or the wallet file. The file is
+/// tolerant on purpose: `export INAZ_KEY='hex'`, `INAZ_KEY=hex`,
+/// `secret key: hex`, or a bare hex line all work, so a hand-edited file or old
+/// keygen output never blocks the operator.
+fn wallet_secret() -> Result<String, String> {
+    if let Ok(k) = std::env::var("INAZ_KEY") {
+        if k.trim().len() == 64 {
+            return Ok(k.trim().to_string());
+        }
+    }
+    let path = wallet_path();
+    let text = std::fs::read_to_string(&path)
+        .map_err(|_| format!("no wallet at {} — run `inazuma wallet-new`", path))?;
+    for line in text.lines() {
+        let cleaned: String = line
+            .trim()
+            .trim_start_matches("export ")
+            .split(['=', ':'])
+            .last()
+            .unwrap_or("")
+            .trim()
+            .trim_matches(['\'', '"', ' '])
+            .to_string();
+        if cleaned.len() == 64 && cleaned.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Ok(cleaned.to_lowercase());
+        }
+    }
+    Err(format!(
+        "{} has no 64-hex secret key — run `inazuma wallet-new` or `inazuma wallet-import --key HEX`",
+        path
+    ))
+}
+
+/// Writes the wallet in the one format every command understands.
+fn write_wallet(kp: &Keypair) -> Result<(), String> {
+    let path = wallet_path();
+    if let Some(dir) = std::path::Path::new(&path).parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(
+        &path,
+        format!(
+            "# Inazuma validator wallet — keep this file private\nexport INAZ_KEY='{}'\nexport INAZ_ADDRESS='{}'\n",
+            kp.secret_hex(),
+            kp.address()
+        ),
+    )
+    .map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+/// JSON-RPC client supporting both local HTTP and public HTTPS endpoints.
 fn rpc_call(
     url: &str,
     method: &str,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    use std::io::{Read, Write};
-    let stripped = url
-        .trim_start_matches("http://")
-        .trim_start_matches("https://");
-    let (host_port, path) = match stripped.split_once('/') {
-        Some((h, p)) => (h, format!("/{}", p)),
-        None => (stripped, "/".to_string()),
+    let endpoint = if url.starts_with("http://") || url.starts_with("https://") {
+        url.to_string()
+    } else {
+        format!("http://{}", url)
     };
     let body = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params })
         .to_string();
-    let mut stream = std::net::TcpStream::connect(host_port).map_err(|e| e.to_string())?;
-    let req = format!(
-        "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        path, host_port, body.len(), body
-    );
-    stream
-        .write_all(req.as_bytes())
-        .map_err(|e| e.to_string())?;
-    let mut resp = String::new();
-    stream
-        .read_to_string(&mut resp)
-        .map_err(|e| e.to_string())?;
-    let json_start = resp.find("\r\n\r\n").ok_or("bad response")? + 4;
-    let parsed: serde_json::Value =
-        serde_json::from_str(&resp[json_start..]).map_err(|e| format!("bad json: {}", e))?;
+    let response = ureq::post(&endpoint)
+        .set("Content-Type", "application/json")
+        .send_string(&body)
+        .map_err(|e| format!("RPC request to {} failed: {}", endpoint, e))?;
+    let response_body = response
+        .into_string()
+        .map_err(|e| format!("could not read response from {}: {}", endpoint, e))?;
+    let parsed: serde_json::Value = serde_json::from_str(&response_body)
+        .map_err(|e| format!("bad JSON response from {}: {}", endpoint, e))?;
     if let Some(err) = parsed.get("error") {
         return Err(err["message"].as_str().unwrap_or("rpc error").to_string());
     }

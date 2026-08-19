@@ -446,7 +446,9 @@ impl Node {
                     return Err("validator is not jailed".into());
                 }
                 if acct.penalties.jailed_until > height {
-                    return Err("jail period has not expired yet".into());
+                    if crate::types::downtime_jail_enabled(height) {
+                        return Err("jail period has not expired yet".into());
+                    }
                 }
             }
             TxKind::CreateToken => {
@@ -1221,7 +1223,7 @@ impl Node {
             return None;
         }
         let height = self.store.tip_height().unwrap_or(0) + 1;
-        if acct.penalties.jailed_until > height {
+        if acct.penalties.jailed_until > height && crate::types::downtime_jail_enabled(height) {
             return None;
         }
         let mut tx = Transaction {

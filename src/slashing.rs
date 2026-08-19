@@ -311,6 +311,15 @@ pub fn apply_unjail(store: &Store, height: u64, address: &str) -> Result<(), Str
         return Err("validator is not jailed".into());
     }
     if acct.penalties.jailed_until > height {
+        if !crate::types::downtime_jail_enabled(height) {
+            // Downtime jails are inert after the liveness fork: clear it now so
+            // legacy jailed validators can rejoin without waiting out the timer.
+            acct.penalties.jailed_until = 0;
+            acct.penalties.missed_streak = 0;
+            store.set_account(address, &acct);
+            println!("[slash] {} downtime jail cleared at #{}", address, height);
+            return Ok(());
+        }
         return Err(format!(
             "still jailed for {} more blocks",
             acct.penalties.jailed_until - height
@@ -367,7 +376,14 @@ pub fn record_liveness(store: &Store, height: u64, parent_hash: &str, producer: 
         let mut acct = store.account(&address);
         acct.penalties.missed_slots += 1;
         acct.penalties.missed_streak += 1;
-        if acct.penalties.missed_streak >= DOWNTIME_JAIL_STREAK && !acct.penalties.tombstoned {
+        if !crate::types::downtime_jail_enabled(height) {
+            // Post-fork liveness: a missed slot only costs the reward for that
+            // slot. No jail, no burn, no manual `unjail` — the validator keeps
+            // its place in the set and resumes as soon as it is back online.
+            store.set_account(&address, &acct);
+        } else if acct.penalties.missed_streak >= DOWNTIME_JAIL_STREAK
+            && !acct.penalties.tombstoned
+        {
             acct.penalties.missed_streak = 0;
             acct.penalties.downtime_jails += 1;
             acct.penalties.jailed_until = height + DOWNTIME_JAIL_BLOCKS;
@@ -404,8 +420,14 @@ pub fn record_liveness(store: &Store, height: u64, parent_hash: &str, producer: 
 
     // Sealing a block clears the producer's streak.
     let mut p = store.account(producer);
-    if p.penalties.missed_streak != 0 {
+    let clear_jail = !crate::types::downtime_jail_enabled(height)
+        && p.penalties.jailed_until != 0
+        && p.penalties.jailed_until != TOMBSTONE_HEIGHT;
+    if p.penalties.missed_streak != 0 || clear_jail {
         p.penalties.missed_streak = 0;
+        if clear_jail {
+            p.penalties.jailed_until = 0;
+        }
         store.set_account(producer, &p);
     }
 }

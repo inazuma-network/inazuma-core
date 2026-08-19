@@ -37,6 +37,17 @@ pub const EVIDENCE_MAX_AGE_BLOCKS: u64 = 100_000;
 /// Sentinel jail height for a permanently removed (tombstoned) validator.
 pub const TOMBSTONE_HEIGHT: u64 = u64::MAX;
 
+/// Height at which downtime jailing is retired (Ethereum-style liveness).
+/// From this height on, missing slots only costs rewards — a validator is never
+/// removed from the active set for being briefly offline, and any existing
+/// downtime jail becomes inert. Provable faults (equivocation) still tombstone.
+pub const NO_DOWNTIME_JAIL_HEIGHT: u64 = 1_400_000;
+
+/// True while downtime still jails, i.e. before the liveness fork.
+pub fn downtime_jail_enabled(height: u64) -> bool {
+    height < NO_DOWNTIME_JAIL_HEIGHT
+}
+
 // ---- sync awareness ----
 
 /// Highest block height any peer has reported to this node. Updated by the p2p
@@ -155,11 +166,24 @@ impl Account {
 impl Account {
     /// Bonded, not jailed and not tombstoned at `height`.
     pub fn is_active_validator(&self, height: u64) -> bool {
-        self.is_validator() && !self.penalties.tombstoned && self.penalties.jailed_until <= height
+        if self.is_validator() && self.penalties.tombstoned {
+            return false;
+        }
+        if !self.is_validator() {
+            return false;
+        }
+        if !downtime_jail_enabled(height) {
+            // Downtime jails no longer gate participation; tombstones still do.
+            return self.penalties.jailed_until != TOMBSTONE_HEIGHT;
+        }
+        self.penalties.jailed_until <= height
     }
 
     pub fn is_jailed(&self, height: u64) -> bool {
-        self.penalties.tombstoned || self.penalties.jailed_until > height
+        if self.penalties.tombstoned || self.penalties.jailed_until == TOMBSTONE_HEIGHT {
+            return true;
+        }
+        downtime_jail_enabled(height) && self.penalties.jailed_until > height
     }
 }
 
