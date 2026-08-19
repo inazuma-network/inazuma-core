@@ -139,7 +139,7 @@ inazuma wallet-new                        # create + save a wallet in ~/.inazuma
 inazuma wallet                            # saved address, balance, stake, rewards
 inazuma slashing                          # params, jail state, slash history
 inazuma report   --evidence ./evidence.json
-inazuma unjail  --key <SECRET>
+inazuma unjail  --key <SECRET>            # legacy: pre-1,400,000 downtime jails only
 inazuma bench   --key <SECRET> --count 1000
 ```
 

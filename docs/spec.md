@@ -22,7 +22,7 @@ code disagree, the code is the current chain and this document is the bug.
 | `MAX_PENDING_PER_SENDER` | 64 | `mempool.rs` |
 | Finality threshold | > 2/3 of active stake | `consensus.rs` |
 | Equivocation burn | 5% floor, 100% cap, correlation term | `slashing.rs` |
-| Downtime jail | 50 consecutive missed slots | `types.rs` |
+| Downtime jail | retired at height 1,400,000 (`NO_DOWNTIME_JAIL_HEIGHT`) | `types.rs` |
 
 ## 2. Accounts and state
 
@@ -101,9 +101,13 @@ or vote on divergent state.
   `equivocation_burn_pct(offender_stake, total_stake)`: 5% floor, plus a
   correlation term rising with the offender's stake share, capped at 100%. The
   offender is tombstoned permanently.
-* **Downtime** — 50 consecutive missed slots jails the validator; repeat offences
-  burn `DOWNTIME_REPEAT_BURN_BPS`. Release requires an `Unjail` transaction after
-  the jail period.
+* **Downtime** — Ethereum-style liveness since `NO_DOWNTIME_JAIL_HEIGHT`
+  (1,400,000): missing slots costs only the rewards for those slots. A validator
+  is never removed from the active set for being offline, existing downtime jails
+  became inert at the fork, and no `Unjail` transaction is needed. Before that
+  height, 50 consecutive missed slots jailed the validator for 10,000 blocks
+  (repeat offences burned `DOWNTIME_REPEAT_BURN_BPS`); that history replays
+  unchanged.
 * Rules activate at `SLASHING_ACTIVATION_HEIGHT` so pre-activation history
   replays unchanged.
 
