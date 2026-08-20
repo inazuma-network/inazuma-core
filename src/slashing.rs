@@ -263,6 +263,7 @@ pub fn apply_report(
     acct.unbonding.retain(|u| u.amount > 0);
     acct.penalties.tombstoned = true;
     acct.penalties.jailed_until = TOMBSTONE_HEIGHT;
+    acct.penalties.jail_fault = true;
     acct.penalties.slashed += burned;
     store.set_account(&offender, &acct);
 
@@ -309,6 +310,9 @@ pub fn apply_unjail(store: &Store, height: u64, address: &str) -> Result<(), Str
     }
     if acct.penalties.jailed_until == 0 {
         return Err("validator is not jailed".into());
+    }
+    if acct.penalties.jail_fault {
+        return Err("this jail came from a provable fault and cannot be lifted".into());
     }
     if acct.penalties.jailed_until > height {
         if !crate::types::downtime_jail_enabled(height) {
@@ -378,8 +382,22 @@ pub fn record_liveness(store: &Store, height: u64, parent_hash: &str, producer: 
         acct.penalties.missed_streak += 1;
         if !crate::types::downtime_jail_enabled(height) {
             // Post-fork liveness: a missed slot only costs the reward for that
-            // slot. No jail, no burn, no manual `unjail` — the validator keeps
-            // its place in the set and resumes as soon as it is back online.
+            // slot. No jail, no manual `unjail` — the validator keeps its place
+            // and resumes as soon as it is back online. Past
+            // `INACTIVITY_LEAK_ACTIVATION_HEIGHT` a *sustained* absence also
+            // decays the bond, so dark stake eventually stops counting toward
+            // the finality denominator instead of stalling the chain forever.
+            if crate::types::inactivity_leak_enabled(height)
+                && acct.penalties.missed_streak >= crate::types::INACTIVITY_LEAK_STREAK
+                && !acct.penalties.tombstoned
+            {
+                let decay = acct.staked * crate::types::INACTIVITY_LEAK_BPS / 10_000;
+                if decay > 0 {
+                    acct.staked -= decay;
+                    acct.penalties.leaked += decay;
+                    acct.penalties.slashed += decay;
+                }
+            }
             store.set_account(&address, &acct);
         } else if acct.penalties.missed_streak >= DOWNTIME_JAIL_STREAK
             && !acct.penalties.tombstoned
@@ -387,6 +405,7 @@ pub fn record_liveness(store: &Store, height: u64, parent_hash: &str, producer: 
             acct.penalties.missed_streak = 0;
             acct.penalties.downtime_jails += 1;
             acct.penalties.jailed_until = height + DOWNTIME_JAIL_BLOCKS;
+            acct.penalties.jail_fault = false;
             // First offence is a jail only. Repeat offenders also pay.
             let mut burned = 0u128;
             if acct.penalties.downtime_jails > 1 {
@@ -420,8 +439,13 @@ pub fn record_liveness(store: &Store, height: u64, parent_hash: &str, producer: 
 
     // Sealing a block clears the producer's streak.
     let mut p = store.account(producer);
+    // Only downtime jails are forgiven post-fork. A jail set by a provable fault
+    // stays, even when it did not tombstone, so sealing a block can never launder
+    // an equivocation slash. Gate on the reason, never on the sentinel value.
     let clear_jail = !crate::types::downtime_jail_enabled(height)
         && p.penalties.jailed_until != 0
+        && !p.penalties.jail_fault
+        && !p.penalties.tombstoned
         && p.penalties.jailed_until != TOMBSTONE_HEIGHT;
     if p.penalties.missed_streak != 0 || clear_jail {
         p.penalties.missed_streak = 0;
@@ -457,6 +481,78 @@ mod tests {
     use super::*;
     use crate::crypto::Keypair;
     use crate::types::txs_root;
+
+    #[test]
+    fn fault_jail_survives_the_liveness_fork() {
+        // A fault jail that did not tombstone must not be forgiven by sealing a
+        // block, and `unjail` must refuse it outright.
+        let post = crate::types::NO_DOWNTIME_JAIL_HEIGHT + 1;
+        let mut p = crate::types::Penalties::default();
+        p.jailed_until = post + 10_000;
+        p.jail_fault = true;
+        // The exact predicate `record_liveness` uses to forgive a jail.
+        let clear = !crate::types::downtime_jail_enabled(post)
+            && p.jailed_until != 0
+            && !p.jail_fault
+            && !p.tombstoned
+            && p.jailed_until != TOMBSTONE_HEIGHT;
+        assert!(!clear, "equivocation jail must never be cleared by producing");
+        p.jail_fault = false;
+        let clear = !crate::types::downtime_jail_enabled(post)
+            && p.jailed_until != 0
+            && !p.jail_fault
+            && !p.tombstoned
+            && p.jailed_until != TOMBSTONE_HEIGHT;
+        assert!(clear, "a plain downtime jail is inert after the fork");
+    }
+
+    #[test]
+    fn liveness_rules_switch_exactly_at_the_fork_height() {
+        let h = crate::types::NO_DOWNTIME_JAIL_HEIGHT;
+        assert!(crate::types::downtime_jail_enabled(h - 1));
+        assert!(!crate::types::downtime_jail_enabled(h));
+        // Every later rule change must be gated strictly above the deploy height,
+        // so no future fork can be retroactive the way this one was.
+        assert!(
+            crate::types::INACTIVITY_LEAK_ACTIVATION_HEIGHT > crate::types::RETRO_FORK_DEPLOY_HEIGHT
+        );
+        assert!(!crate::types::inactivity_leak_enabled(
+            crate::types::INACTIVITY_LEAK_ACTIVATION_HEIGHT - 1
+        ));
+        assert!(crate::types::inactivity_leak_enabled(
+            crate::types::INACTIVITY_LEAK_ACTIVATION_HEIGHT
+        ));
+    }
+
+    #[test]
+    fn legacy_downtime_jail_does_not_gate_participation_after_the_fork() {
+        let mut a = crate::types::Account {
+            staked: crate::types::MIN_STAKE,
+            ..Default::default()
+        };
+        a.penalties.jailed_until = 9_000_000; // stale pre-fork jail
+        assert!(!a.is_active_validator(crate::types::NO_DOWNTIME_JAIL_HEIGHT - 1));
+        assert!(a.is_active_validator(crate::types::NO_DOWNTIME_JAIL_HEIGHT));
+        a.penalties.tombstoned = true;
+        a.penalties.jailed_until = TOMBSTONE_HEIGHT;
+        assert!(!a.is_active_validator(crate::types::NO_DOWNTIME_JAIL_HEIGHT + 1));
+    }
+
+    #[test]
+    fn inactivity_leak_shrinks_a_dark_bond_out_of_the_set() {
+        // A validator that never comes back leaks below MIN_STAKE, so >1/3 dark
+        // stake stops holding finality hostage forever.
+        let mut staked = crate::types::MIN_STAKE * 2;
+        let mut slots = 0u64;
+        while staked >= crate::types::MIN_STAKE && slots < 100_000 {
+            let decay = staked * crate::types::INACTIVITY_LEAK_BPS / 10_000;
+            assert!(decay > 0);
+            staked -= decay;
+            slots += 1;
+        }
+        assert!(staked < crate::types::MIN_STAKE, "leak must terminate");
+        assert!(slots < 100_000);
+    }
 
     fn signed_header(kp: &Keypair, height: u64, state_root: &str) -> HeaderProof {
         let mut b = Block {

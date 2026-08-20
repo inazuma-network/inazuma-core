@@ -41,11 +41,45 @@ pub const TOMBSTONE_HEIGHT: u64 = u64::MAX;
 /// From this height on, missing slots only costs rewards — a validator is never
 /// removed from the active set for being briefly offline, and any existing
 /// downtime jail becomes inert. Provable faults (equivocation) still tombstone.
+///
+/// **Already activated, and activated retroactively.** The rule shipped after
+/// the devnet had passed this height (tip was ~1.40M–1.52M during the rollout),
+/// so blocks in `[NO_DOWNTIME_JAIL_HEIGHT, RETRO_FORK_DEPLOY_HEIGHT)` were
+/// produced under the old active-set rules and are replayed under the new ones.
+/// That window can only differ if a validator carried a downtime jail while
+/// producing or voting inside it; `verify-history` replays genesis→tip and any
+/// second client MUST reproduce the same result. Every future rule change is
+/// gated at a height strictly greater than the current tip (see
+/// `INACTIVITY_LEAK_ACTIVATION_HEIGHT`) so this never happens again.
 pub const NO_DOWNTIME_JAIL_HEIGHT: u64 = 1_400_000;
+
+/// Height the no-downtime-jail code was actually deployed to the public network.
+/// Purely informational: it documents the retroactive window above.
+pub const RETRO_FORK_DEPLOY_HEIGHT: u64 = 1_403_733;
+
+/// Height the inactivity leak activates. Strictly in the future when merged.
+/// Removing downtime jails alone leaves an offline validator counting toward the
+/// 2/3 finality denominator forever, so >1/3 dark stake stalls the chain with no
+/// way to shrink the set. From this height a validator that keeps missing slots
+/// has its bond decayed per missed slot; once the bond falls under `MIN_STAKE`
+/// it leaves the active set on its own and the denominator shrinks. Coming back
+/// online stops the decay immediately — the offline cost is gradual, not a jail.
+pub const INACTIVITY_LEAK_ACTIVATION_HEIGHT: u64 = 2_000_000;
+
+/// Consecutive missed slots before the leak starts biting.
+pub const INACTIVITY_LEAK_STREAK: u64 = 50;
+
+/// Bond decay per missed slot once leaking, in basis points (0.05%).
+pub const INACTIVITY_LEAK_BPS: u128 = 5;
 
 /// True while downtime still jails, i.e. before the liveness fork.
 pub fn downtime_jail_enabled(height: u64) -> bool {
     height < NO_DOWNTIME_JAIL_HEIGHT
+}
+
+/// True once the inactivity leak replaces downtime jailing as the liveness cost.
+pub fn inactivity_leak_enabled(height: u64) -> bool {
+    height >= INACTIVITY_LEAK_ACTIVATION_HEIGHT
 }
 
 // ---- sync awareness ----
@@ -151,6 +185,15 @@ pub struct Penalties {
     /// How many times this validator has been jailed for downtime.
     #[serde(default)]
     pub downtime_jails: u64,
+    /// True when `jailed_until` was set by a provable fault (equivocation), not
+    /// by downtime. Fault jails are never forgiven by the liveness rules: only
+    /// the reason distinguishes them, so the sentinel value must not be used as
+    /// a proxy for "this jail is safe to clear".
+    #[serde(default)]
+    pub jail_fault: bool,
+    /// Lifetime bond decayed by the inactivity leak.
+    #[serde(default)]
+    pub leaked: u128,
 }
 
 impl Account {

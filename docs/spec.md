@@ -22,7 +22,9 @@ code disagree, the code is the current chain and this document is the bug.
 | `MAX_PENDING_PER_SENDER` | 64 | `mempool.rs` |
 | Finality threshold | > 2/3 of active stake | `consensus.rs` |
 | Equivocation burn | 5% floor, 100% cap, correlation term | `slashing.rs` |
-| Downtime jail | retired at height 1,400,000 (`NO_DOWNTIME_JAIL_HEIGHT`) | `types.rs` |
+| Downtime jail | retired at height 1,400,000 (`NO_DOWNTIME_JAIL_HEIGHT`), already active | `types.rs` |
+| Retro fork deploy height | 1,403,733 (`RETRO_FORK_DEPLOY_HEIGHT`) | `types.rs` |
+| Inactivity leak | activates at 2,000,000 (`INACTIVITY_LEAK_ACTIVATION_HEIGHT`) | `types.rs` |
 
 ## 2. Accounts and state
 
@@ -108,8 +110,34 @@ or vote on divergent state.
   height, 50 consecutive missed slots jailed the validator for 10,000 blocks
   (repeat offences burned `DOWNTIME_REPEAT_BURN_BPS`); that history replays
   unchanged.
+  A jail set by a provable fault is **not** a downtime jail and is never cleared
+  by the liveness rules: forgiveness is gated on `Penalties::jail_fault`, not on
+  the `TOMBSTONE_HEIGHT` sentinel, so an equivocation slash that jails without
+  tombstoning cannot be laundered by sealing a block, and `Unjail` refuses it.
+* **Inactivity leak** — from `INACTIVITY_LEAK_ACTIVATION_HEIGHT` (2,000,000),
+  a validator whose missed streak reaches `INACTIVITY_LEAK_STREAK` (50) has its
+  bond decayed by `INACTIVITY_LEAK_BPS` (5 bp) per further missed slot. Coming
+  back online stops the decay. Once the bond falls below `MIN_STAKE` the
+  validator leaves the active set on its own, so the 2/3 denominator shrinks and
+  dark stake cannot hold finality hostage indefinitely — the replacement for
+  jailing, which retiring downtime jails otherwise left with no liveness cost.
 * Rules activate at `SLASHING_ACTIVATION_HEIGHT` so pre-activation history
   replays unchanged.
+
+### 7.1 Fork-height discipline (and one exception)
+
+Every consensus rule change is gated at a height **strictly greater than the tip
+at merge time**. `NO_DOWNTIME_JAIL_HEIGHT` broke that rule: it was merged after
+the public devnet had already passed 1,400,000 and was deployed at
+`RETRO_FORK_DEPLOY_HEIGHT` (1,403,733). Blocks in
+`[1,400,000, 1,403,733)` were produced under the old active-set rules and are
+replayed under the new ones; they differ only if a validator carried a downtime
+jail while producing or voting inside that window. A second client MUST
+implement the constants exactly as written here, including the retroactive
+window, and MUST pass the genesis→tip replay test
+(`conformance::c10_replay_from_genesis_reproduces_the_same_head`). Any commit
+message or blog post quoting a different height (e.g. "1.5M") is wrong; this
+document and `types.rs` are normative.
 
 ## 8. Fees
 

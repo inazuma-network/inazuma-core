@@ -166,6 +166,11 @@ pub struct Node {
     /// block and never votes. Adding replicas scales reads without touching the
     /// validator set, so read traffic cannot crowd out consensus.
     serving_only: AtomicBool,
+    /// Persistent equivocation guard: remembers the highest height this key
+    /// signed, across restarts and snapshot restores. Two processes sharing a
+    /// key, or a rewound database, would otherwise double-sign and tombstone
+    /// the validator permanently.
+    sign_guard: Mutex<Option<std::sync::Arc<crate::signguard::SignGuard>>>,
 }
 
 impl Node {
@@ -183,6 +188,7 @@ impl Node {
             events: EventBus::new(),
             announced_final: AtomicU64::new(0),
             serving_only: AtomicBool::new(false),
+            sign_guard: Mutex::new(None),
         }
     }
 
@@ -192,6 +198,15 @@ impl Node {
 
     pub fn attach_gossip(&self, p2p: std::sync::Arc<crate::p2p::P2p>) {
         *self.gossip.lock().unwrap() = Some(p2p);
+    }
+
+    /// Install the persistent double-sign guard. Called once at boot.
+    pub fn attach_sign_guard(&self, guard: std::sync::Arc<crate::signguard::SignGuard>) {
+        *self.sign_guard.lock().unwrap() = Some(guard);
+    }
+
+    fn sign_guard(&self) -> Option<std::sync::Arc<crate::signguard::SignGuard>> {
+        self.sign_guard.lock().unwrap().clone()
     }
 
     /// Forward a locally accepted transaction to peers so any leader can include it.
@@ -785,6 +800,22 @@ impl Node {
             return Ok(None);
         }
 
+        // Never sign the same height twice. This catches the two operational
+        // ways a validator gets tombstoned by accident: a second process
+        // started with the same key, and a database rewound below what this key
+        // already signed (snapshot restore, restored backup, wiped data dir).
+        if let Some(guard) = self.sign_guard() {
+            if !guard.may_sign(height) {
+                eprintln!(
+                    "[guard] refusing to seal #{}: this key already signed up to #{} \
+                     (another node running with the same key, or a rewound database)",
+                    height,
+                    guard.highest_signed()
+                );
+                return Ok(None);
+            }
+        }
+
         let set = staking::validator_set(&self.store);
         let attempt = self.current_attempt();
         let elected = staking::elect_leader_attempt(&set, height, &parent_hash, attempt);
@@ -847,6 +878,11 @@ impl Node {
             hash: String::new(),
         };
         block.signature = self.producer.sign_hex(&block.header_bytes());
+        // Persisted before the block is stored or gossiped, so a crash right
+        // after signing still remembers this height as spent.
+        if let Some(guard) = self.sign_guard() {
+            guard.record(block.height);
+        }
         block.hash = block.compute_hash();
         self.store.put_block(&block);
         self.store.set_base_fee(fees::next_base_fee(

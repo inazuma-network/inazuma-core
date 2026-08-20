@@ -757,8 +757,14 @@ fn dispatch(node: &Arc<Node>, method: &str, params: &Value) -> Result<Value, Str
                     "slashedInaz": format_inaz(v.slashed),
                     "jailed": false,
                 })).collect::<Vec<_>>(),
+                // Post-fork, a downtime jail no longer sidelines anyone, so only
+                // tombstoned keys (and pre-fork jails) are reported as jailed.
                 "jailed": staking::bonded_set(&node.store).iter()
-                    .filter(|v| v.tombstoned || v.jailed_until > node.store.tip_height().unwrap_or(0) + 1)
+                    .filter(|v| {
+                        let h = node.store.tip_height().unwrap_or(0) + 1;
+                        v.tombstoned
+                            || (crate::types::downtime_jail_enabled(h) && v.jailed_until > h)
+                    })
                     .map(|v| json!({
                         "address": v.address,
                         "stakeInaz": format_inaz(v.stake),

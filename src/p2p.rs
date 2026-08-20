@@ -374,6 +374,10 @@ fn handle_msg(node: &Arc<Node>, p2p: &Arc<P2p>, msg: &Value, ip: Option<IpAddr>)
             "height": node.store.tip_height().unwrap_or(0),
             "hash": node.store.tip_hash(),
             "finalized": node.store.finalized_height(),
+            // Lowest block body this node can still serve. Peers need it to
+            // tell "you are behind" apart from "I pruned the history you want",
+            // which is unrecoverable by block sync and needs a snapshot.
+            "earliest": node.store.pruned_below(),
         })),
         "getblocks" => {
             let from = msg.get("from").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -486,6 +490,25 @@ pub fn sync_once(node: &Arc<Node>, p2p: &Arc<P2p>) {
         if peer_height + 1 < from {
             continue; // peer is behind us; nothing to pull
         }
+        // A pruned peer cannot serve the blocks between our tip and its floor.
+        // Retrying forever ("out of order") is the failure mode that leaves a
+        // fresh or reset node stuck at height 0 indefinitely, so say plainly
+        // what the operator has to do and move on to the next peer.
+        let peer_earliest = status
+            .as_ref()
+            .and_then(|s| s.get("earliest"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        if peer_earliest > from {
+            eprintln!(
+                "[sync] {} pruned history below #{} and we are at #{}: block sync cannot bridge \
+                 that gap. Restore a snapshot (inazuma snapshot-import) to jump to a recent state.",
+                peer,
+                peer_earliest,
+                from - 1
+            );
+            continue;
+        }
         let res = match p2p.request(
             peer,
             &json!({ "t": "getblocks", "from": from, "limit": MAX_SYNC_BATCH }),
@@ -550,6 +573,25 @@ fn resolve_fork(node: &Arc<Node>, p2p: &Arc<P2p>, peer: &str, peer_height: u64) 
         if let Some(ip) = peer.split(':').next().and_then(|h| h.parse().ok()) {
             p2p.book.penalize(ip, COST_BAD_BLOCK);
         }
+        return;
+    }
+    // Replaying from genesis only works if the peer still has the history. On a
+    // pruned network it does not: the node wipes a good database, cannot refill
+    // it, and sits at height 0 forever. Keep local state instead and let the
+    // operator restore a snapshot.
+    let peer_earliest = p2p
+        .request(peer, &json!({ "t": "status" }))
+        .ok()
+        .and_then(|s| s.get("earliest").and_then(|v| v.as_u64()))
+        .unwrap_or(0);
+    if peer_earliest > 1 {
+        eprintln!(
+            "[fork] not replaying from genesis: {} pruned below #{}. Keeping local state at #{} — \
+             restore a snapshot if this node is on a dead branch.",
+            peer,
+            peer_earliest,
+            node.store.tip_height().unwrap_or(0)
+        );
         return;
     }
     println!(

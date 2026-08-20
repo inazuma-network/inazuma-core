@@ -26,6 +26,7 @@ mod qos;
 mod rpc;
 mod rpcauth;
 mod simulate;
+mod signguard;
 mod slashing;
 mod smt;
 mod snapshot;
@@ -273,6 +274,18 @@ fn run() -> Result<(), String> {
                     .with_required_encryption(require_encryption),
             );
             node.attach_gossip(Arc::clone(&network));
+            // Equivocation guard lives next to the data dir, not inside it, so
+            // restoring a snapshot cannot forget what this key already signed.
+            if !replica {
+                let guard = Arc::new(signguard::SignGuard::open(&data, &node.producer.address()));
+                if guard.highest_signed() > 0 {
+                    println!(
+                        "[guard] highest height already signed by this key: #{}",
+                        guard.highest_signed()
+                    );
+                }
+                node.attach_sign_guard(guard);
+            }
             // With peers present the node follows the elected leader instead of
             // sealing every slot itself.
             node.set_serving_only(replica);
@@ -813,15 +826,30 @@ fn run() -> Result<(), String> {
                 "sync           {}",
                 if syncing { "syncing — do not stake yet" } else { "in sync" }
             );
-            if let Ok(net) = rpc_call(
-                "https://rpc.inazuma.network",
-                "inaz_nodeStatus",
-                serde_json::json!({}),
-            ) {
-                let tip = net["height"].as_u64().unwrap_or(0);
-                if tip > 0 && !rpc_url.contains("rpc.inazuma.network") {
-                    println!("network tip    {} (behind by {})", tip, tip.saturating_sub(height));
+            // Comparing against the public tip means telling the foundation's RPC
+            // that this operator's node exists, so it is opt-in: pass
+            // `--compare` (or `--compare URL`) or set INAZ_STATUS_COMPARE=1.
+            let compare = flags.contains_key("compare")
+                || std::env::var("INAZ_STATUS_COMPARE").is_ok_and(|v| v != "0");
+            if compare {
+                let remote = flags
+                    .get("compare")
+                    .filter(|v| v.starts_with("http"))
+                    .cloned()
+                    .unwrap_or_else(|| "https://rpc.inazuma.network".into());
+                if let Ok(net) = rpc_call(&remote, "inaz_nodeStatus", serde_json::json!({})) {
+                    let tip = net["height"].as_u64().unwrap_or(0);
+                    if tip > 0 && !rpc_url.contains(remote.trim_start_matches("https://")) {
+                        println!(
+                            "network tip    {} (behind by {}, via {})",
+                            tip,
+                            tip.saturating_sub(height),
+                            remote
+                        );
+                    }
                 }
+            } else {
+                println!("network tip    (skipped — pass --compare to query the public RPC)");
             }
             Ok(())
         }
@@ -1787,25 +1815,47 @@ fn wallet_secret() -> Result<String, String> {
 }
 
 /// Writes the wallet in the one format every command understands.
+///
+/// The secret never touches a world-readable file: it is written to a temp file
+/// created with 0600 (Unix) or inside the user-private wallet directory
+/// (elsewhere), then renamed over the target. Renaming is atomic, so there is no
+/// window where a half-written or permissive copy of the key exists on disk.
 fn write_wallet(kp: &Keypair) -> Result<(), String> {
     let path = wallet_path();
     if let Some(dir) = std::path::Path::new(&path).parent() {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        }
     }
-    std::fs::write(
-        &path,
-        format!(
-            "# Inazuma validator wallet — keep this file private\nexport INAZ_KEY='{}'\nexport INAZ_ADDRESS='{}'\n",
-            kp.secret_hex(),
-            kp.address()
-        ),
-    )
-    .map_err(|e| e.to_string())?;
-    #[cfg(unix)]
+    let body = format!(
+        "# Inazuma validator wallet — keep this file private\nexport INAZ_KEY='{}'\nexport INAZ_ADDRESS='{}'\n",
+        kp.secret_hex(),
+        kp.address()
+    );
+    let tmp = format!("{}.tmp", path);
+    let _ = std::fs::remove_file(&tmp);
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        use std::io::Write;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&tmp).map_err(|e| e.to_string())?;
+        f.write_all(body.as_bytes()).map_err(|e| e.to_string())?;
+        f.sync_all().map_err(|e| e.to_string())?;
     }
+    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+    #[cfg(not(unix))]
+    println!(
+        "note: {} holds your secret key in plaintext. On Windows, restrict it with\n      icacls \"{}\" /inheritance:r /grant:r \"%USERNAME%:F\"",
+        path, path
+    );
     Ok(())
 }
 
