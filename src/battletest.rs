@@ -364,6 +364,111 @@ fn buffered_votes_finalize_on_arrival() {
     assert_eq!(st.finalized_height(), 1);
 }
 
+/// The live-net finality stall: on a 3-validator set with equal stake, 2/3 of
+/// the stake is NOT strictly greater than the threshold, so every height needs
+/// all three precommits. Gossip is fire-and-forget, so one dropped vote used
+/// to freeze finality forever. This pins the fix: votes must be re-servable
+/// (getvotes / votes_above) and re-counted on reconciliation.
+#[test]
+fn lost_vote_recovered_by_reconciliation() {
+    let st_recv = store();
+    let st_send = store();
+    let a = Keypair::generate();
+    let b = Keypair::generate();
+    let c = Keypair::generate();
+    for st in [&st_recv, &st_send] {
+        bond(st, &a, MIN_STAKE);
+        bond(st, &b, MIN_STAKE);
+        bond(st, &c, MIN_STAKE);
+    }
+    let blk = sealed(&a, 1, &"0".repeat(64), "r1");
+    st_recv.put_block(&blk);
+    st_send.put_block(&blk);
+
+    let recv = VoteTracker::new();
+    let send = VoteTracker::new();
+
+    // Receiver gets 2 of 3 votes over gossip: NOT final (2/3 is not > 2/3).
+    recv.add(&st_recv, vote(&a, 1, &blk.hash)).unwrap();
+    recv.add(&st_recv, vote(&b, 1, &blk.hash)).unwrap();
+    assert_eq!(st_recv.finalized_height(), 0, "2 of 3 equal votes must not finalize");
+
+    // Sender saw all three; the third was lost on the wire to the receiver.
+    send.add(&st_send, vote(&a, 1, &blk.hash)).unwrap();
+    send.add(&st_send, vote(&b, 1, &blk.hash)).unwrap();
+    send.add(&st_send, vote(&c, 1, &blk.hash)).unwrap();
+    assert_eq!(st_send.finalized_height(), 1);
+
+    // Reconciliation: receiver pulls what the sender counted, re-counts it.
+    let served = send.votes_above(st_recv.finalized_height(), 4_096);
+    assert_eq!(served.len(), 3);
+    let mut finalized = None;
+    for v in served {
+        if let Some(h) = recv.add(&st_recv, v).unwrap().finalized {
+            finalized = Some(h);
+        }
+    }
+    assert_eq!(finalized, Some(1));
+    assert_eq!(st_recv.finalized_height(), 1);
+
+    // After finality the sender still serves a trailing window of settled
+    // heights, so a peer whose finality lags can catch up over getvotes.
+    assert_eq!(send.votes_above(0, 4_096).len(), 3);
+    // ...but a peer already past the window asks from its own finalized
+    // height and gets nothing it has settled.
+    assert!(send.votes_above(1, 4_096).is_empty());
+}
+
+/// getvotes serving: strictly above the requested height, oldest first,
+/// bounded by the limit.
+#[test]
+fn votes_above_serves_recent_only() {
+    let st = store();
+    let a = Keypair::generate();
+    let b = Keypair::generate();
+    let c = Keypair::generate();
+    bond(&st, &a, MIN_STAKE);
+    bond(&st, &b, MIN_STAKE);
+    bond(&st, &c, MIN_STAKE);
+    let tracker = VoteTracker::new();
+    // 2 of 3 votes per height: counted but NOT final (2/3 is not > 2/3), so
+    // every height stays in the tracker unfinalized.
+    for h in 1..=4u64 {
+        let blk = sealed(&a, h, &"0".repeat(64), &format!("r{}", h));
+        st.put_block(&blk);
+        tracker.add(&st, vote(&a, h, &blk.hash)).unwrap();
+        tracker.add(&st, vote(&b, h, &blk.hash)).unwrap();
+    }
+    assert_eq!(st.finalized_height(), 0);
+    let served = tracker.votes_above(0, 100);
+    assert_eq!(served.len(), 8, "two voters x heights 1..=4");
+    assert!(served.windows(2).all(|w| w[0].height <= w[1].height), "oldest first");
+    let above = tracker.votes_above(2, 100);
+    assert_eq!(above.len(), 4, "two voters x heights 3 and 4");
+    assert!(above.iter().all(|v| v.height > 2));
+    assert_eq!(tracker.votes_above(0, 3).len(), 3, "limit is honoured");
+    assert!(tracker.votes_above(4, 100).is_empty());
+}
+
+/// The pending buffer must survive a node lagging under load: 64/validator
+/// was ~25s at 400ms slots and evicted real precommits before their blocks
+/// landed. The cap is now 512/validator (~3.4min).
+#[test]
+fn pending_buffer_survives_lag_under_load() {
+    let st = store();
+    let a = Keypair::generate();
+    bond(&st, &a, MIN_STAKE);
+    let tracker = VoteTracker::new();
+    // Blocks never arrive; 600 votes pile up (cap is 512 for a 1-validator set).
+    for h in 9_000..9_600u64 {
+        tracker.add(&st, vote(&a, h, &"a".repeat(64))).unwrap();
+    }
+    // Oldest evicted: re-adding height 9000 counts as fresh again.
+    assert!(tracker.add(&st, vote(&a, 9_000, &"a".repeat(64))).unwrap().fresh);
+    // Recent still buffered: a duplicate is not fresh.
+    assert!(!tracker.add(&st, vote(&a, 9_599, &"a".repeat(64))).unwrap().fresh);
+}
+
 /// Clock skew: ±15s / 30s / 60s. Future blocks outside the 12s tolerance are
 /// rejected; a lagging clock never rejects an honest, monotonic block.
 #[test]
@@ -1163,7 +1268,7 @@ fn state_at(store: &Store, kp: &Keypair, height: u64) -> Block {
         ..Account::default()
     };
     store.set_account("snapshot-holder", &holder);
-    store.build_merkle_state();
+    store.build_merkle_state(height);
     let root = store.state_root_at(height);
     let block = sealed(kp, height, "parent-hash", &root);
     store.put_block(&block);

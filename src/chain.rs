@@ -53,6 +53,79 @@ pub const MIN_TIMESTAMP_SPACING_MS: u128 = 1;
 /// asks an operator instead of silently rewriting its own history.
 pub const MAX_REORG_DEPTH: u64 = 5_000;
 
+/// Cheap shape validation for shielded payloads, run at admission (mempool)
+/// and again at execution. Consensus-relevant: every node must reject the
+/// same malformed payloads before any proof work happens.
+pub fn check_shielded_shape(tx: &Transaction) -> Result<(), String> {
+    let data = tx.shielded.as_ref().ok_or("missing shielded payload")?;
+    // Groth16 over BN254 compresses to 128 bytes = 256 hex chars. Anything
+    // larger is garbage that would only waste verifier cycles.
+    if data.proof.len() > 512 {
+        return Err("shielded proof field too large".into());
+    }
+    for f in data
+        .commitments
+        .iter()
+        .chain(data.nullifiers.iter())
+        .chain(std::iter::once(&data.anchor))
+    {
+        if !f.is_empty() && crate::poseidon::fr_from_hex(f).is_none() {
+            return Err("shielded payload has a non-field element".into());
+        }
+    }
+    let public_unshield = if data.public_unshield.is_empty() {
+        0
+    } else {
+        data.public_unshield
+            .parse::<u128>()
+            .map_err(|_| "bad public unshield amount".to_string())?
+    };
+    match tx.kind {
+        TxKind::Shield => {
+            if data.commitments.len() != 1
+                || !data.nullifiers.is_empty()
+                || !data.proof.is_empty()
+                || public_unshield != 0
+            {
+                return Err("shield: exactly one commitment, no nullifiers, no proof".into());
+            }
+            if tx.amount == 0 {
+                return Err("shield: amount must be positive".into());
+            }
+        }
+        TxKind::PrivateTransfer => {
+            if data.nullifiers.len() != 2 || data.commitments.len() != 2 || data.proof.is_empty() {
+                return Err("private transfer: two nullifiers, two commitments, one proof".into());
+            }
+            if tx.amount != 0 || public_unshield != 0 {
+                return Err("private transfer: amount fields must be zero".into());
+            }
+            if data.nullifiers[0] == data.nullifiers[1] {
+                return Err("private transfer: duplicate nullifier".into());
+            }
+        }
+        TxKind::Unshield => {
+            if data.nullifiers.len() != 2 || data.commitments.len() != 2 || data.proof.is_empty() {
+                return Err("unshield: two nullifiers, two commitments, one proof".into());
+            }
+            if tx.amount != 0 {
+                return Err("unshield: amount field must be zero".into());
+            }
+            if public_unshield == 0 {
+                return Err("unshield: public amount must be positive".into());
+            }
+            if data.nullifiers[0] == data.nullifiers[1] {
+                return Err("unshield: duplicate nullifier".into());
+            }
+        }
+        _ => return Err("not a shielded transaction".into()),
+    }
+    if tx.kind != TxKind::Shield && data.anchor.is_empty() {
+        return Err("spend: missing anchor".into());
+    }
+    Ok(())
+}
+
 /// Consensus rule for how deep an automatic unwind may go. Pure, so it can be
 /// tested and fuzzed directly.
 pub fn check_reorg_depth(local_tip: u64, peer_height: u64) -> Result<(), String> {
@@ -429,6 +502,13 @@ impl Node {
             return Err(format!("fee below current base fee ({} rai)", floor));
         }
         match tx.kind {
+            TxKind::Shield | TxKind::PrivateTransfer | TxKind::Unshield => {
+                let next = self.store.tip_height().unwrap_or(0) + 1;
+                if next < crate::shielded::activation_height() {
+                    return Err("shielded pool is not active yet".into());
+                }
+                check_shielded_shape(&tx)?;
+            }
             TxKind::Transfer => {
                 if !is_valid_address(&tx.to) {
                     return Err("invalid recipient address".into());
@@ -506,10 +586,7 @@ impl Node {
             TxKind::ReportEquivocation | TxKind::Unjail => tx.fee,
             TxKind::CreateToken => tx.fee.saturating_add(TOKEN_CREATION_FEE),
             TxKind::MintToken | TxKind::TokenTransfer | TxKind::BurnToken => tx.fee,
-            TxKind::DeployContract => tx
-                .fee
-                .saturating_add(DEPLOY_FEE)
-                .saturating_add(tx.amount),
+            TxKind::DeployContract => tx.fee.saturating_add(DEPLOY_FEE).saturating_add(tx.amount),
             _ => tx.amount.saturating_add(tx.fee),
         };
         if acct.balance < required {
@@ -581,10 +658,10 @@ impl Node {
             TxKind::ReportEquivocation | TxKind::Unjail => tx.fee,
             TxKind::CreateToken => tx.fee.saturating_add(TOKEN_CREATION_FEE),
             TxKind::MintToken | TxKind::TokenTransfer | TxKind::BurnToken => tx.fee,
-            TxKind::DeployContract => tx
-                .fee
-                .saturating_add(DEPLOY_FEE)
-                .saturating_add(tx.amount),
+            TxKind::DeployContract => tx.fee.saturating_add(DEPLOY_FEE).saturating_add(tx.amount),
+            // Spends pay only the fee: the value moves inside the pool, and an
+            // unshield's amount is paid out of the pool, not by the sender.
+            TxKind::PrivateTransfer | TxKind::Unshield => tx.fee,
             _ => tx.amount.saturating_add(tx.fee),
         };
         if from.balance < debit {
@@ -594,6 +671,11 @@ impl Node {
         from.nonce += 1;
 
         match tx.kind {
+            // Gated in `admit`; reaching apply means the fork height passed.
+            TxKind::Shield | TxKind::PrivateTransfer | TxKind::Unshield => {
+                self.store.set_account(&sender, &from);
+                self.apply_shielded(tx, height)?;
+            }
             TxKind::Transfer => {
                 if tx.to == sender {
                     from.balance += tx.amount;
@@ -755,6 +837,128 @@ impl Node {
         Ok(collected)
     }
 
+    /// Execute a shielded transaction against the pool. The sender's account
+    /// (fee paid, nonce bumped) is already stored by the caller; everything
+    /// here either succeeds completely or the tx-level journal undoes it.
+    fn apply_shielded(&self, tx: &Transaction, height: u64) -> Result<(), String> {
+        use crate::poseidon;
+        // Height gate lives here too, not just in admission: a block imported
+        // from a peer must be rejected if it carries shielded transactions
+        // before the fork height, whoever produced it.
+        if height < crate::shielded::activation_height() {
+            return Err("shielded pool is not active at this height".into());
+        }
+        let data = tx.shielded.clone().ok_or("missing shielded payload")?;
+        check_shielded_shape(tx)?;
+        match tx.kind {
+            TxKind::Shield => {
+                let cm = poseidon::fr_from_hex(&data.commitments[0])
+                    .ok_or("shield: bad commitment field")?;
+                if cm == ark_bn254::Fr::from(0u64) {
+                    return Err("shield: zero commitment".into());
+                }
+                self.store.shielded_append(&data.commitments[0]);
+                let bal = self.store.shielded_pool_balance();
+                self.store.shielded_set_pool_balance(
+                    bal.checked_add(tx.amount).ok_or("pool balance overflow")?,
+                );
+                Ok(())
+            }
+            TxKind::PrivateTransfer | TxKind::Unshield => {
+                let unshield_out = if tx.kind == TxKind::Unshield {
+                    data.public_unshield
+                        .parse::<u128>()
+                        .map_err(|_| "bad public unshield amount".to_string())?
+                } else {
+                    0
+                };
+                // Conservation check before any write: the pool can never pay
+                // out more than was shielded into it.
+                if unshield_out > 0 {
+                    if !is_valid_address(&tx.to) {
+                        return Err("unshield: invalid recipient address".into());
+                    }
+                    if self.store.shielded_pool_balance() < unshield_out {
+                        return Err("unshield: pool underflow".into());
+                    }
+                }
+                if !self.store.shielded_root_known(&data.anchor) {
+                    return Err("spend: anchor is not a sealed tree root".into());
+                }
+                let proof = crate::shielded_circuit::proof_from_hex(&data.proof)
+                    .ok_or("spend: bad proof encoding")?;
+                let vk = match self.store.shielded_verifying_key() {
+                    Some(bytes) => crate::shielded_circuit::vk_from_hex(&hex::encode(bytes))
+                        .ok_or("stored verifying key is corrupt")?,
+                    // First spend after activation installs the deterministic
+                    // devnet parameters. A production ceremony replaces them
+                    // before mainnet activation; see docs/shielded.md.
+                    None => {
+                        let (_pk, vk) = crate::shielded_circuit::devnet_setup();
+                        self.store
+                            .shielded_set_verifying_key(&crate::shielded_circuit::vk_to_bytes(&vk));
+                        vk
+                    }
+                };
+                let inputs = vec![
+                    poseidon::fr_from_hex(&data.anchor).ok_or("spend: bad anchor field")?,
+                    poseidon::fr_from_hex(&data.nullifiers[0]).ok_or("bad nullifier")?,
+                    poseidon::fr_from_hex(&data.nullifiers[1]).ok_or("bad nullifier")?,
+                    poseidon::fr_from_hex(&data.commitments[0]).ok_or("bad commitment")?,
+                    poseidon::fr_from_hex(&data.commitments[1]).ok_or("bad commitment")?,
+                    poseidon::fr_u128(unshield_out),
+                ];
+                if !crate::shielded_circuit::verify(&vk, &proof, &inputs) {
+                    return Err("spend: invalid proof".into());
+                }
+                // Proof is valid; now burn. A repeated nullifier is a
+                // double-spend attempt no matter how good the proof looks.
+                for nf in &data.nullifiers {
+                    if !self.store.shielded_burn_nullifier(nf, height) {
+                        return Err("spend: nullifier already spent".into());
+                    }
+                }
+                for c in &data.commitments {
+                    self.store.shielded_append(c);
+                }
+                if unshield_out > 0 {
+                    let bal = self.store.shielded_pool_balance();
+                    self.store.shielded_set_pool_balance(bal - unshield_out);
+                    let mut to = self.store.account(&tx.to);
+                    to.balance += unshield_out;
+                    self.store.set_account(&tx.to, &to);
+                }
+                Ok(())
+            }
+            _ => Err("not a shielded transaction".into()),
+        }
+    }
+
+    /// Seal the shielded tree root for this height so spends can anchor to it,
+    /// and fold root + pool balance into the Merkle state root. Skipped when
+    /// no shielded tx touched the pool this block — the root is unchanged.
+    fn seal_shielded_root(&self, height: u64) {
+        if height < crate::shielded::activation_height() {
+            return;
+        }
+        let count = self.store.shielded_leaf_count();
+        if count == self.store.shielded_last_sealed_count() && self.store.shielded_leaf_count() > 0
+        {
+            return;
+        }
+        let leaves: Vec<ark_bn254::Fr> = self
+            .store
+            .shielded_leaves()
+            .iter()
+            .filter_map(|h| crate::poseidon::fr_from_hex(h))
+            .collect();
+        let root = crate::shielded::root_from_leaves(&leaves);
+        let root_hex = crate::poseidon::fr_to_hex(&root);
+        self.store.shielded_seal_root(&root_hex, height);
+        self.store.shielded_set_last_sealed_count(count);
+        self.store.shielded_seal_into_state(&root_hex);
+    }
+
     /// Active validator set: accounts staking at least the minimum.
     pub fn validators(&self) -> Vec<Validator> {
         staking::validator_set(&self.store)
@@ -864,6 +1068,7 @@ impl Node {
         // is already out of the set that gets paid.
         slashing::record_liveness(&self.store, height, &parent_hash, &producer_addr);
         staking::pay_rewards(&self.store, &producer_addr, fees);
+        self.seal_shielded_root(height);
 
         let mut block = Block {
             height,
@@ -1007,6 +1212,7 @@ impl Node {
             &block.producer,
         );
         staking::pay_rewards(&self.store, &block.producer, fees);
+        self.seal_shielded_root(block.height);
 
         let local_root = self.store.state_root_at(block.height);
         if local_root != block.state_root {
@@ -1230,6 +1436,7 @@ impl Node {
             nonce: self.pending_nonce(&self.producer.address()),
             chain_id: self.genesis.chain_id,
             payload: Some(slashing::encode(evidence)),
+            shielded: None,
             signature: String::new(),
         };
         tx.signature = self.producer.sign_hex(&tx.signing_bytes());
@@ -1271,13 +1478,18 @@ impl Node {
             nonce: self.pending_nonce(&address),
             chain_id: self.genesis.chain_id,
             payload: None,
+            shielded: None,
             signature: String::new(),
         };
         tx.signature = self.producer.sign_hex(&tx.canonical_signing_bytes());
         match self.accept_tx(tx.clone()) {
             Ok(hash) => {
                 self.gossip_tx(&tx);
-                println!("[slash] self-unjail submitted at #{} -> {}", height, &hash[..8]);
+                println!(
+                    "[slash] self-unjail submitted at #{} -> {}",
+                    height,
+                    &hash[..8]
+                );
                 Some(hash)
             }
             Err(e) => {

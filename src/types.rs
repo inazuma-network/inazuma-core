@@ -18,6 +18,23 @@ pub const UNBONDING_BLOCKS: u64 = 300;
 /// Height at which downtime accounting and jailing switch on. Set ahead of the
 /// live tip so upgrading nodes replay existing history byte-identically.
 pub const SLASHING_ACTIVATION_HEIGHT: u64 = 130_000;
+/// Effective activation height for *this* node's chain. The mainnet-track chain
+/// keeps the constant above so upgrading nodes replay existing history
+/// byte-identically; a brand-new genesis (public testnet, devnet, adversarial
+/// harness) may set `slashing_activation_height` and get slashing from block 1.
+/// It is chain identity, not an operator knob — it comes from genesis only.
+pub static SLASHING_ACTIVATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(SLASHING_ACTIVATION_HEIGHT);
+
+/// Called once at boot, from genesis. Never call this at runtime: two nodes with
+/// different activation heights would disagree on liveness accounting and fork.
+pub fn set_slashing_activation(h: u64) {
+    SLASHING_ACTIVATION.store(h, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn slashing_activation() -> u64 {
+    SLASHING_ACTIVATION.load(std::sync::atomic::Ordering::Relaxed)
+}
 /// Floor burn for signing two conflicting blocks or votes at the same height.
 pub const EQUIVOCATION_MIN_BURN_PCT: u128 = 5;
 /// Correlation multiplier: burn scales with the offender's share of total stake,
@@ -102,6 +119,36 @@ pub fn note_peer_height(height: u64) {
 
 pub fn best_peer_height() -> u64 {
     BEST_PEER_HEIGHT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Serde helper: carry a `u128` as a JSON string.
+///
+/// Internally tagged enums (`#[serde(tag = "kind")]`) buffer their contents
+/// through serde's `Content` type, which cannot represent 128-bit integers —
+/// deserializing such a field fails with "u128 is not supported". Any u128 that
+/// travels inside a tagged enum (e.g. equivocation evidence headers) must use
+/// this module, or the message can be produced but never parsed.
+pub mod u128_str {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &u128, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&v.to_string())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<u128, D::Error> {
+        // Accept both the string form and a plain number, so older peers and
+        // hand-written RPC payloads keep working.
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Either {
+            S(String),
+            N(u64),
+        }
+        match Either::deserialize(d)? {
+            Either::S(s) => s.parse().map_err(serde::de::Error::custom),
+            Either::N(n) => Ok(n as u128),
+        }
+    }
 }
 
 pub fn format_inaz(rai: u128) -> String {
@@ -230,7 +277,7 @@ impl Account {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TxKind {
     Transfer,
@@ -252,6 +299,13 @@ pub enum TxKind {
     DeployContract,
     /// Execute a deployed contract.
     CallContract,
+    /// Move public INAZ into the shielded pool, creating private notes.
+    Shield,
+    /// Move value between shielded notes. Amounts and parties are hidden;
+    /// validity is proven with a Groth16 spend proof.
+    PrivateTransfer,
+    /// Exit the shielded pool: burn notes, credit a public address.
+    Unshield,
 }
 
 impl TxKind {
@@ -268,6 +322,9 @@ impl TxKind {
             TxKind::BurnToken => "burntoken",
             TxKind::DeployContract => "deploycontract",
             TxKind::CallContract => "callcontract",
+            TxKind::Shield => "shield",
+            TxKind::PrivateTransfer => "privatetransfer",
+            TxKind::Unshield => "unshield",
         }
     }
 
@@ -285,6 +342,35 @@ impl TxKind {
     pub fn is_contract(&self) -> bool {
         matches!(self, TxKind::DeployContract | TxKind::CallContract)
     }
+
+    pub fn is_shielded(&self) -> bool {
+        matches!(
+            self,
+            TxKind::Shield | TxKind::PrivateTransfer | TxKind::Unshield
+        )
+    }
+}
+
+/// Zcash-style shielded data. Every field is a string so the transaction JSON
+/// stays plain: field elements are 0x-prefixed 32-byte hex, amounts decimal.
+/// Part of the signed bytes (v2 preimage only — shielded kinds never sign v1).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ShieldedData {
+    /// Commitment-tree root the spend proof anchors to.
+    #[serde(default)]
+    pub anchor: String,
+    /// Revealed nullifiers of the spent notes (hex field elements).
+    #[serde(default)]
+    pub nullifiers: Vec<String>,
+    /// Commitments of the notes created by this transaction.
+    #[serde(default)]
+    pub commitments: Vec<String>,
+    /// Groth16 proof, hex. Empty for Shield (public value in, no proof needed).
+    #[serde(default)]
+    pub proof: String,
+    /// Public value leaving the pool (Unshield), in rai, decimal.
+    #[serde(default)]
+    pub public_unshield: String,
 }
 
 /// Extra fields carried by token transactions. Part of the signed bytes, so a
@@ -371,6 +457,9 @@ pub struct Transaction {
     /// Only present on token transactions.
     #[serde(default)]
     pub payload: Option<Payload>,
+    /// Only present on shielded transactions.
+    #[serde(default)]
+    pub shielded: Option<ShieldedData>,
     #[serde(default)]
     pub signature: String,
 }
@@ -442,6 +531,25 @@ impl Transaction {
                 push_str(&mut b, &p.args);
             }
         }
+        // Shielded data is signed too: an anchor or nullifier swapped in
+        // flight must invalidate the signature.
+        match &self.shielded {
+            None => b.push(0),
+            Some(s) => {
+                b.push(1);
+                push_str(&mut b, &s.anchor);
+                b.extend_from_slice(&(s.nullifiers.len() as u32).to_be_bytes());
+                for n in &s.nullifiers {
+                    push_str(&mut b, n);
+                }
+                b.extend_from_slice(&(s.commitments.len() as u32).to_be_bytes());
+                for c in &s.commitments {
+                    push_str(&mut b, c);
+                }
+                push_str(&mut b, &s.proof);
+                push_str(&mut b, &s.public_unshield);
+            }
+        }
         b
     }
 
@@ -462,6 +570,15 @@ impl Transaction {
     }
 
     pub fn verify_signature(&self) -> bool {
+        // Shielded kinds sign the v2 preimage only: v1 has no encoding for
+        // their fields, so accepting it would leave them unsigned.
+        if self.kind.is_shielded() {
+            return verify(
+                &self.from_pubkey,
+                &self.canonical_signing_bytes(),
+                &self.signature,
+            );
+        }
         // v2 first: it is unambiguous by construction.
         if verify(
             &self.from_pubkey,
@@ -570,6 +687,10 @@ pub struct Genesis {
     pub decimals: u8,
     pub block_time_ms: u64,
     pub alloc: Vec<GenesisAlloc>,
+    /// Optional. Omitted on the mainnet-track chain, which uses
+    /// `SLASHING_ACTIVATION_HEIGHT`.
+    #[serde(default)]
+    pub slashing_activation_height: Option<u64>,
 }
 
 impl Genesis {
@@ -580,6 +701,7 @@ impl Genesis {
             symbol: "INAZ".into(),
             decimals: 9,
             block_time_ms: 400,
+            slashing_activation_height: None,
             alloc: vec![GenesisAlloc {
                 address: admin.to_string(),
                 balance: "1000000".into(),
@@ -604,6 +726,7 @@ mod signing_tests {
             chain_id: CHAIN_ID,
             payload,
             signature: String::new(),
+            shielded: None,
         }
     }
 

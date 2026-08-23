@@ -51,6 +51,7 @@ fn net(tag: &str) -> (Arc<Node>, Keypair) {
         symbol: "INAZ".into(),
         decimals: 9,
         block_time_ms: 400,
+        slashing_activation_height: None,
         alloc: vec![GenesisAlloc {
             address: kp.address(),
             balance: "1000000".into(),
@@ -83,6 +84,7 @@ fn signed(
         chain_id: 7777,
         payload,
         signature: String::new(),
+        shielded: None,
     };
     tx.signature = kp.sign_hex(&tx.canonical_signing_bytes());
     tx
@@ -107,7 +109,8 @@ fn c1_block_production_under_normal_conditions() {
     let (node, kp) = net("c1a");
     let bob = Keypair::generate().address();
     for i in 0..10u64 {
-        node.accept_tx(transfer(&kp, &bob, RAI_PER_INAZ, i)).unwrap();
+        node.accept_tx(transfer(&kp, &bob, RAI_PER_INAZ, i))
+            .unwrap();
         let h = seal(&node);
         assert_eq!(h, i + 1, "height must advance one per block");
     }
@@ -239,7 +242,8 @@ fn c1_total_supply_only_grows_by_block_reward() {
     let bob = Keypair::generate().address();
     let start = node.store.total_supply();
     for i in 0..6u64 {
-        node.accept_tx(transfer(&kp, &bob, RAI_PER_INAZ, i)).unwrap();
+        node.accept_tx(transfer(&kp, &bob, RAI_PER_INAZ, i))
+            .unwrap();
         seal(&node);
     }
     let end = node.store.total_supply();
@@ -330,9 +334,12 @@ fn c2_replay_of_same_tx_is_rejected() {
 fn c2_stale_nonce_is_rejected() {
     let (node, kp) = net("c2h");
     let bob = Keypair::generate().address();
-    node.accept_tx(transfer(&kp, &bob, RAI_PER_INAZ, 0)).unwrap();
+    node.accept_tx(transfer(&kp, &bob, RAI_PER_INAZ, 0))
+        .unwrap();
     seal(&node);
-    assert!(node.accept_tx(transfer(&kp, &bob, RAI_PER_INAZ, 0)).is_err());
+    assert!(node
+        .accept_tx(transfer(&kp, &bob, RAI_PER_INAZ, 0))
+        .is_err());
 }
 
 #[test]
@@ -506,7 +513,8 @@ fn c4_pending_nonce_tracks_mempool() {
     let (node, kp) = net("c4b");
     let bob = Keypair::generate().address();
     assert_eq!(node.pending_nonce(&kp.address()), 0);
-    node.accept_tx(transfer(&kp, &bob, RAI_PER_INAZ, 0)).unwrap();
+    node.accept_tx(transfer(&kp, &bob, RAI_PER_INAZ, 0))
+        .unwrap();
     assert_eq!(node.pending_nonce(&kp.address()), 1);
 }
 
@@ -669,7 +677,8 @@ fn c5_snapshot_roundtrip_restores_identical_state() {
     let (node, kp) = net("c5e");
     let bob = Keypair::generate().address();
     for n in 0..5 {
-        node.accept_tx(transfer(&kp, &bob, RAI_PER_INAZ, n)).unwrap();
+        node.accept_tx(transfer(&kp, &bob, RAI_PER_INAZ, n))
+            .unwrap();
         seal(&node);
     }
     let snap = snapshot::export(&node.store, 7777).unwrap();
@@ -762,7 +771,10 @@ fn c6_wasm_is_deterministic_across_runs() {
     let base = crate::contracts::execute(&st, "c", "x", &code, b"get".to_vec(), 0, 1, 10_000_000);
     for _ in 0..30 {
         let o = crate::contracts::execute(&st, "c", "x", &code, b"get".to_vec(), 0, 1, 10_000_000);
-        assert_eq!((o.ok, o.fuel_used, o.ret), (base.ok, base.fuel_used, base.ret.clone()));
+        assert_eq!(
+            (o.ok, o.fuel_used, o.ret),
+            (base.ok, base.fuel_used, base.ret.clone())
+        );
     }
 }
 
@@ -825,10 +837,19 @@ fn c6_token_lifecycle_create_mint_transfer_burn() {
         token: id.clone(),
         ..Default::default()
     };
-    tokens::apply_mint(&node.store, &kp.address(), &kp.address(), 500, &Some(tp.clone())).unwrap();
+    tokens::apply_mint(
+        &node.store,
+        &kp.address(),
+        &kp.address(),
+        500,
+        &Some(tp.clone()),
+    )
+    .unwrap();
     assert_eq!(node.store.token_balance(&id, &kp.address()), 1_500);
-    assert!(tokens::check_token_transfer(&node.store, &kp.address(), &bob, 400, &Some(tp.clone()))
-        .is_ok());
+    assert!(
+        tokens::check_token_transfer(&node.store, &kp.address(), &bob, 400, &Some(tp.clone()))
+            .is_ok()
+    );
     tokens::apply_token_transfer(&node.store, &kp.address(), &bob, 400, &Some(tp.clone())).unwrap();
     assert_eq!(node.store.token_balance(&id, &bob), 400);
     assert!(
@@ -886,7 +907,10 @@ fn c6_unit_parsing_roundtrips() {
             s
         );
     }
-    assert!(tokens::parse_units("1.2345678901", 9).is_err(), "over-precision accepted");
+    assert!(
+        tokens::parse_units("1.2345678901", 9).is_err(),
+        "over-precision accepted"
+    );
     assert!(tokens::parse_units("-1", 9).is_err(), "negative accepted");
 }
 
@@ -919,7 +943,8 @@ fn c7_core_read_methods_answer() {
 fn c7_unknown_method_errors_cleanly() {
     let (node, _) = net("c7b");
     let cfg = cfg_public();
-    let r = crate::rpc::dispatch_metered(&node, "eth_iDoNotExist", &json!({}), &cfg, Tier::Anonymous);
+    let r =
+        crate::rpc::dispatch_metered(&node, "eth_iDoNotExist", &json!({}), &cfg, Tier::Anonymous);
     assert!(r.is_err());
 }
 
@@ -930,7 +955,10 @@ fn c7_netinfo_is_redacted_for_anonymous() {
     let v = crate::rpc::dispatch_metered(&node, "inaz_netInfo", &json!({}), &cfg, Tier::Anonymous)
         .unwrap();
     let s = v.to_string();
-    assert!(!s.contains("\"peers\":["), "peer list leaked to anon caller");
+    assert!(
+        !s.contains("\"peers\":["),
+        "peer list leaked to anon caller"
+    );
     assert!(s.contains("redacted") || s.contains("peerCount"));
 }
 
@@ -938,7 +966,8 @@ fn c7_netinfo_is_redacted_for_anonymous() {
 fn c7_admin_only_method_refuses_anonymous() {
     let (node, _) = net("c7d");
     let cfg = cfg_public();
-    let r = crate::rpc::dispatch_metered(&node, "inaz_rpcLimits", &json!({}), &cfg, Tier::Anonymous);
+    let r =
+        crate::rpc::dispatch_metered(&node, "inaz_rpcLimits", &json!({}), &cfg, Tier::Anonymous);
     assert!(r.is_err(), "privileged method served to anon caller");
     let ok = crate::rpc::dispatch_metered(&node, "inaz_rpcLimits", &json!({}), &cfg, Tier::Admin);
     assert!(ok.is_ok(), "admin tier refused");
@@ -950,7 +979,13 @@ fn c7_send_transaction_over_rpc_lands_in_pool() {
     let cfg = cfg_public();
     let tx = transfer(&kp, &Keypair::generate().address(), RAI_PER_INAZ, 0);
     let params = json!({ "tx": serde_json::to_value(&tx).unwrap() });
-    let r = crate::rpc::dispatch_metered(&node, "inaz_sendTransaction", &params, &cfg, Tier::Anonymous);
+    let r = crate::rpc::dispatch_metered(
+        &node,
+        "inaz_sendTransaction",
+        &params,
+        &cfg,
+        Tier::Anonymous,
+    );
     assert!(r.is_ok(), "valid tx refused over rpc: {:?}", r.err());
     assert_eq!(node.mempool_size(), 1);
 }
@@ -1084,6 +1119,7 @@ fn c9_canonical_encoding_is_injective_over_random_fields() {
             chain_id: 7777,
             payload: None,
             signature: String::new(),
+            shielded: None,
         };
         assert!(
             seen.insert(tx.canonical_signing_bytes()),
@@ -1173,7 +1209,12 @@ fn c9_fuzz_random_transactions_never_panic() {
     };
     for _ in 0..1_000 {
         let kp = Keypair::generate();
-        let mut tx = transfer(&kp, &Keypair::generate().address(), rnd() as u128, rnd() % 5);
+        let mut tx = transfer(
+            &kp,
+            &Keypair::generate().address(),
+            rnd() as u128,
+            rnd() % 5,
+        );
         if rnd() % 3 == 0 {
             tx.signature = hex::encode([0u8; 64]);
         }
@@ -1213,7 +1254,10 @@ fn c10_legacy_and_v2_signatures_both_verify() {
     let kp = Keypair::generate();
     let mut legacy = transfer(&kp, &Keypair::generate().address(), RAI_PER_INAZ, 0);
     legacy.signature = kp.sign_hex(&legacy.signing_bytes());
-    assert!(legacy.verify_signature(), "legacy signer broken (fork risk)");
+    assert!(
+        legacy.verify_signature(),
+        "legacy signer broken (fork risk)"
+    );
     let mut modern = legacy.clone();
     modern.signature = kp.sign_hex(&modern.canonical_signing_bytes());
     assert!(modern.verify_signature(), "v2 signer broken");
@@ -1229,6 +1273,7 @@ fn c10_genesis_is_byte_identical_across_nodes() {
             symbol: "INAZ".into(),
             decimals: 9,
             block_time_ms: 400,
+            slashing_activation_height: None,
             alloc: vec![GenesisAlloc {
                 address: kp.address(),
                 balance: "1000000".into(),
@@ -1255,7 +1300,8 @@ fn c10_replay_from_genesis_reproduces_the_same_head() {
     let (node, kp) = net("c10c");
     let bob = Keypair::generate().address();
     for n in 0..12 {
-        node.accept_tx(transfer(&kp, &bob, RAI_PER_INAZ, n)).unwrap();
+        node.accept_tx(transfer(&kp, &bob, RAI_PER_INAZ, n))
+            .unwrap();
         seal(&node);
     }
     let tip = node.store.tip_height().unwrap();
@@ -1285,8 +1331,13 @@ fn c10_replay_from_genesis_reproduces_the_same_head() {
 #[test]
 fn c10_replica_rejects_a_tampered_block() {
     let (node, kp) = net("c10e");
-    node.accept_tx(transfer(&kp, &Keypair::generate().address(), RAI_PER_INAZ, 0))
-        .unwrap();
+    node.accept_tx(transfer(
+        &kp,
+        &Keypair::generate().address(),
+        RAI_PER_INAZ,
+        0,
+    ))
+    .unwrap();
     seal(&node);
     let mut b = node.store.block(1).unwrap();
     b.transactions.clear();
@@ -1297,4 +1348,390 @@ fn c10_replica_rejects_a_tampered_block() {
         Arc::new(n)
     };
     assert!(replica.import_block(&b).is_err(), "tampered block imported");
+}
+
+// ================================================== §12 shielded pool
+//
+// Zcash-style joinsplit: shield, private transfer, unshield, and the
+// adversarial rejections (double-spend, forged proof, unknown anchor,
+// oversized proof, pre-activation). Groth16 setup is shared across the
+// module via a OnceLock so the suite pays the ceremony cost once.
+
+mod shielded_tests {
+    use super::*;
+    use crate::poseidon::{fr_from_hex, fr_to_hex};
+    use crate::shielded as sh;
+    use crate::shielded_circuit as sc;
+    use crate::types::ShieldedData;
+    use ark_bn254::Fr;
+    use ark_groth16::{ProvingKey, VerifyingKey};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, OnceLock};
+
+    /// Serializes every test that flips INAZ_SHIELDED_ACTIVATION.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    static PARAMS: OnceLock<(ProvingKey<ark_bn254::Bn254>, VerifyingKey<ark_bn254::Bn254>)> =
+        OnceLock::new();
+    fn params() -> &'static (ProvingKey<ark_bn254::Bn254>, VerifyingKey<ark_bn254::Bn254>) {
+        PARAMS.get_or_init(sc::devnet_setup)
+    }
+
+    static NOTE_COUNTER: AtomicU64 = AtomicU64::new(1);
+    /// Deterministic-but-unique field element for test keys/rhos.
+    fn fr_rand() -> Fr {
+        let c = NOTE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        crate::poseidon::hash2(Fr::from(0x1bad_u64), Fr::from(c * 7919 + std::process::id() as u64))
+    }
+
+    struct TNote {
+        sk: Fr,
+        value: u128,
+        rho: Fr,
+    }
+    fn note(value: u128) -> TNote {
+        TNote { sk: fr_rand(), value, rho: fr_rand() }
+    }
+    fn cm_hex(n: &TNote) -> String {
+        fr_to_hex(&sh::note_commitment(sh::owner_tag(n.sk), n.value, n.rho))
+    }
+
+    fn shielded_tx(
+        kp: &Keypair,
+        kind: TxKind,
+        to: &str,
+        amount: u128,
+        nonce: u64,
+        data: ShieldedData,
+    ) -> Transaction {
+        let mut tx = Transaction {
+            kind,
+            from_pubkey: kp.pubkey_hex(),
+            to: to.to_string(),
+            amount,
+            fee: MIN_FEE,
+            nonce,
+            chain_id: 7777,
+            payload: None,
+            signature: String::new(),
+            shielded: Some(data),
+        };
+        tx.signature = kp.sign_hex(&tx.canonical_signing_bytes());
+        tx
+    }
+
+    /// Shield a note and seal the block it lands in.
+    fn shield(node: &Arc<Node>, kp: &Keypair, n: &TNote, nonce: u64) {
+        let data = ShieldedData { commitments: vec![cm_hex(n)], ..Default::default() };
+        let tx = shielded_tx(kp, TxKind::Shield, &kp.address(), n.value, nonce, data);
+        node.accept_tx(tx).unwrap();
+        seal(node);
+    }
+
+    fn position_of(node: &Arc<Node>, cm: &str) -> u64 {
+        node.store
+            .shielded_leaves()
+            .iter()
+            .position(|h| h == cm)
+            .expect("commitment not in tree") as u64
+    }
+
+    fn current_leaves(node: &Arc<Node>) -> Vec<Fr> {
+        node.store
+            .shielded_leaves()
+            .iter()
+            .map(|h| fr_from_hex(h).unwrap())
+            .collect()
+    }
+
+    /// Build and prove a spend (PrivateTransfer or Unshield). Dummy inputs
+    /// are zero-value notes with a random spend key; their path is ignored
+    /// because the circuit only enforces membership for value-carrying notes.
+    fn build_spend(
+        node: &Arc<Node>,
+        kind: TxKind,
+        inputs: [&TNote; 2],
+        positions: [u64; 2],
+        outputs: [sc::OutputNote; 2],
+        public_unshield: u128,
+        to: &str,
+        kp: &Keypair,
+        nonce: u64,
+    ) -> Transaction {
+        build_spend_on(&current_leaves(node), kind, inputs, positions, outputs, public_unshield, to, kp, nonce)
+    }
+
+    /// Same as build_spend but anchored to an explicit leaf snapshot — needed
+    /// to replay old anchors for double-spend attempts.
+    #[allow(clippy::too_many_arguments)]
+    fn build_spend_on(
+        leaves: &[Fr],
+        kind: TxKind,
+        inputs: [&TNote; 2],
+        positions: [u64; 2],
+        outputs: [sc::OutputNote; 2],
+        public_unshield: u128,
+        to: &str,
+        kp: &Keypair,
+        nonce: u64,
+    ) -> Transaction {
+        let anchor = sh::root_from_leaves(leaves);
+        let mk_input = |n: &TNote, pos: u64| sc::SpendNote {
+            spend_key: n.sk,
+            value: n.value,
+            rho: n.rho,
+            position: pos,
+            path: if n.value == 0 {
+                (0..sh::TREE_DEPTH).map(sh::zero_subtree_root).collect()
+            } else {
+                sh::merkle_path(leaves, pos as usize).expect("no path for live note")
+            },
+        };
+        let circuit = sc::SpendCircuit {
+            anchor,
+            nullifiers: [
+                sh::nullifier(inputs[0].sk, positions[0]),
+                sh::nullifier(inputs[1].sk, positions[1]),
+            ],
+            out_commitments: [
+                sh::note_commitment(outputs[0].owner, outputs[0].value, outputs[0].rho),
+                sh::note_commitment(outputs[1].owner, outputs[1].value, outputs[1].rho),
+            ],
+            public_unshield,
+            inputs: [mk_input(inputs[0], positions[0]), mk_input(inputs[1], positions[1])],
+            outputs,
+        };
+        let data = ShieldedData {
+            anchor: fr_to_hex(&anchor),
+            nullifiers: circuit.nullifiers.iter().map(fr_to_hex).collect(),
+            commitments: circuit.out_commitments.iter().map(fr_to_hex).collect(),
+            proof: sc::proof_to_hex(&sc::prove(&params().0, circuit.clone()).unwrap()),
+            public_unshield: if public_unshield > 0 { public_unshield.to_string() } else { String::new() },
+        };
+        shielded_tx(kp, kind, to, 0, nonce, data)
+    }
+
+    fn nf_hex(sk: Fr, pos: u64) -> String {
+        fr_to_hex(&sh::nullifier(sk, pos))
+    }
+
+    #[test]
+    fn c12_shielded_rejected_before_activation() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("INAZ_SHIELDED_ACTIVATION");
+        let (node, kp) = net("c12a");
+        let n = note(5 * RAI_PER_INAZ);
+        let data = ShieldedData { commitments: vec![cm_hex(&n)], ..Default::default() };
+        let tx = shielded_tx(&kp, TxKind::Shield, &kp.address(), n.value, 0, data);
+        let err = node.accept_tx(tx).unwrap_err();
+        assert!(err.contains("not active"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn c12_shielded_rejected_on_wrong_kind_shape() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("INAZ_SHIELDED_ACTIVATION", "1");
+        let (node, kp) = net("c12b");
+        // Missing shielded payload on a Shield tx.
+        let tx = super::signed(TxKind::Shield, &kp, &kp.address(), 5 * RAI_PER_INAZ, MIN_FEE, 0, None);
+        assert!(node.accept_tx(tx).is_err(), "payload-less shield admitted");
+        // Oversized proof blob rejected at admission.
+        let data = ShieldedData {
+            nullifiers: vec![nf_hex(fr_rand(), 0), nf_hex(fr_rand(), 1)],
+            commitments: vec![fr_to_hex(&fr_rand()), fr_to_hex(&fr_rand())],
+            proof: "ab".repeat(600),
+            anchor: fr_to_hex(&fr_rand()),
+            ..Default::default()
+        };
+        let tx = shielded_tx(&kp, TxKind::PrivateTransfer, "", 0, 0, data);
+        let err = node.accept_tx(tx).unwrap_err();
+        assert!(err.contains("proof"), "unexpected error: {err}");
+        std::env::remove_var("INAZ_SHIELDED_ACTIVATION");
+    }
+
+    #[test]
+    fn c12_shield_private_unshield_roundtrip() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("INAZ_SHIELDED_ACTIVATION", "1");
+        let (node, kp) = net("c12c");
+        let user = Keypair::generate();
+        let alice = user.address();
+        node.accept_tx(transfer(&kp, &alice, 1000 * RAI_PER_INAZ, 0)).unwrap();
+        seal(&node);
+        let kp = &user;
+        let before = node.store.account(&alice).balance;
+
+        // Shield two notes: 5 and 7 INAZ.
+        let n1 = note(5 * RAI_PER_INAZ);
+        let n2 = note(7 * RAI_PER_INAZ);
+        shield(&node, &kp, &n1, 0);
+        shield(&node, &kp, &n2, 1);
+        assert_eq!(node.store.shielded_leaf_count(), 2);
+        assert_eq!(node.store.shielded_pool_balance(), 12 * RAI_PER_INAZ);
+        assert_eq!(
+            node.store.account(&alice).balance,
+            before - 12 * RAI_PER_INAZ - 2 * MIN_FEE,
+            "shield must debit amount+fee"
+        );
+
+        // Private transfer: 12 INAZ across n1+n2 -> 9 to bob, 3 change.
+        let bob_sk = fr_rand();
+        let out_bob = sc::OutputNote { owner: sh::owner_tag(bob_sk), value: 9 * RAI_PER_INAZ, rho: fr_rand() };
+        let out_change = sc::OutputNote { owner: sh::owner_tag(fr_rand()), value: 3 * RAI_PER_INAZ, rho: fr_rand() };
+        let (p1, p2) = (position_of(&node, &cm_hex(&n1)), position_of(&node, &cm_hex(&n2)));
+        let tx = build_spend(
+            &node, TxKind::PrivateTransfer,
+            [&n1, &n2], [p1, p2],
+            [out_bob.clone(), out_change], 0, "", &kp, 2,
+        );
+        node.accept_tx(tx).unwrap();
+        seal(&node);
+        assert_eq!(node.store.shielded_leaf_count(), 4);
+        assert_eq!(node.store.shielded_pool_balance(), 12 * RAI_PER_INAZ, "private transfer must not move the pool");
+        assert!(node.store.shielded_nullifier_seen(&nf_hex(n1.sk, p1)));
+        assert!(node.store.shielded_nullifier_seen(&nf_hex(n2.sk, p2)));
+
+        // Unshield bob's 9 INAZ note to a fresh public address. The tx is
+        // relayed by alice: the proof, not the sender, proves note ownership.
+        let bob_addr = Keypair::generate().address();
+        let bob_note = TNote { sk: bob_sk, value: 9 * RAI_PER_INAZ, rho: out_bob.rho };
+        let dummy = note(0);
+        let pb = position_of(&node, &cm_hex(&bob_note));
+        let zero_out = |_: u8| sc::OutputNote { owner: sh::owner_tag(fr_rand()), value: 0, rho: fr_rand() };
+        let tx = build_spend(
+            &node, TxKind::Unshield,
+            [&bob_note, &dummy], [pb, 0],
+            [zero_out(0), zero_out(1)], 9 * RAI_PER_INAZ, &bob_addr, &kp, 3,
+        );
+        node.accept_tx(tx).unwrap();
+        seal(&node);
+        assert_eq!(node.store.account(&bob_addr).balance, 9 * RAI_PER_INAZ, "unshielded funds missing");
+        assert_eq!(node.store.shielded_pool_balance(), 3 * RAI_PER_INAZ);
+        assert_eq!(
+            node.store.account(&alice).balance,
+            before - 12 * RAI_PER_INAZ - 4 * MIN_FEE,
+            "spends must debit fee only"
+        );
+        std::env::remove_var("INAZ_SHIELDED_ACTIVATION");
+    }
+
+    #[test]
+    fn c12_shielded_adversarial_rejections() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("INAZ_SHIELDED_ACTIVATION", "1");
+        let (node, kp) = net("c12d");
+        let user = Keypair::generate();
+        node.accept_tx(transfer(&kp, &user.address(), 1000 * RAI_PER_INAZ, 0)).unwrap();
+        seal(&node);
+        let kp = &user;
+        let n1 = note(4 * RAI_PER_INAZ);
+        let n2 = note(6 * RAI_PER_INAZ);
+        shield(&node, &kp, &n1, 0);
+        shield(&node, &kp, &n2, 1);
+        let (p1, p2) = (position_of(&node, &cm_hex(&n1)), position_of(&node, &cm_hex(&n2)));
+        let out1 = sc::OutputNote { owner: sh::owner_tag(fr_rand()), value: 10 * RAI_PER_INAZ, rho: fr_rand() };
+        let out2 = sc::OutputNote { owner: sh::owner_tag(fr_rand()), value: 0, rho: fr_rand() };
+        let good = build_spend(
+            &node, TxKind::PrivateTransfer,
+            [&n1, &n2], [p1, p2],
+            [out1, out2], 0, "", kp, 2,
+        );
+
+        // 1) Double spend: same notes replayed under a fresh nonce with a
+        //    fresh proof anchored to the (still known) pre-spend root.
+        let leaves_pre = current_leaves(&node);
+        node.accept_tx(good.clone()).unwrap();
+        seal(&node);
+        let leaves_after = node.store.shielded_leaf_count();
+        let pool_after = node.store.shielded_pool_balance();
+        let replay_out1 = sc::OutputNote { owner: sh::owner_tag(fr_rand()), value: 10 * RAI_PER_INAZ, rho: fr_rand() };
+        let replay_out2 = sc::OutputNote { owner: sh::owner_tag(fr_rand()), value: 0, rho: fr_rand() };
+        let replay = build_spend_on(
+            &leaves_pre, TxKind::PrivateTransfer,
+            [&n1, &n2], [p1, p2],
+            [replay_out1, replay_out2], 0, "", kp, 3,
+        );
+        node.accept_tx(replay).expect("replay should pass admission (shape is valid)");
+        seal(&node);
+        assert_eq!(node.store.shielded_leaf_count(), leaves_after, "double spend added leaves");
+        assert_eq!(node.store.shielded_pool_balance(), pool_after, "double spend moved the pool");
+
+        // 2) Forged payload: valid proof but a tampered output commitment.
+        let n3 = note(2 * RAI_PER_INAZ);
+        shield(&node, &kp, &n3, 3); // replay failed at execution, nonce not consumed
+        let dummy = note(0);
+        let p3 = position_of(&node, &cm_hex(&n3));
+        let o1 = sc::OutputNote { owner: sh::owner_tag(fr_rand()), value: 2 * RAI_PER_INAZ, rho: fr_rand() };
+        let o2 = sc::OutputNote { owner: sh::owner_tag(fr_rand()), value: 0, rho: fr_rand() };
+        let mut forged = build_spend(&node, TxKind::PrivateTransfer, [&n3, &dummy], [p3, 0], [o1, o2], 0, "", &kp, 4);
+        forged.shielded.as_mut().unwrap().commitments[0] = fr_to_hex(&fr_rand());
+        forged.signature = kp.sign_hex(&forged.canonical_signing_bytes());
+        node.accept_tx(forged).unwrap();
+        seal(&node);
+        assert!(!node.store.shielded_nullifier_seen(&nf_hex(n3.sk, p3)), "forged proof executed");
+        assert_eq!(node.store.shielded_leaf_count(), leaves_after + 1, "forged proof added leaves");
+
+        // 3) Unknown anchor: honestly-shaped spend anchored to a random root.
+        let n4 = note(3 * RAI_PER_INAZ);
+        shield(&node, &kp, &n4, 4); // forged spend failed at execution, nonce not consumed
+        let p4 = position_of(&node, &cm_hex(&n4));
+        let o1 = sc::OutputNote { owner: sh::owner_tag(fr_rand()), value: 3 * RAI_PER_INAZ, rho: fr_rand() };
+        let o2 = sc::OutputNote { owner: sh::owner_tag(fr_rand()), value: 0, rho: fr_rand() };
+        let mut bad_anchor = build_spend(&node, TxKind::PrivateTransfer, [&n4, &dummy], [p4, 0], [o1, o2], 0, "", &kp, 5);
+        bad_anchor.shielded.as_mut().unwrap().anchor = fr_to_hex(&fr_rand());
+        bad_anchor.signature = kp.sign_hex(&bad_anchor.canonical_signing_bytes());
+        node.accept_tx(bad_anchor).unwrap();
+        seal(&node);
+        assert!(!node.store.shielded_nullifier_seen(&nf_hex(n4.sk, p4)), "unknown-anchor spend executed");
+
+        // n3 and n4 remain spendable — their nullifiers were never burned.
+        let info_leaves = node.store.shielded_leaf_count();
+        assert!(position_of(&node, &cm_hex(&n3)) == p3);
+        assert!(info_leaves >= leaves_after + 2);
+        std::env::remove_var("INAZ_SHIELDED_ACTIVATION");
+    }
+
+    #[test]
+    fn c12_reorg_wipe_clears_shielded_state() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("INAZ_SHIELDED_ACTIVATION", "1");
+        let (node, kp) = net("c12e");
+        let n = note(5 * RAI_PER_INAZ);
+        shield(&node, &kp, &n, 0);
+        let nullifier = nf_hex(n.sk, 0);
+        assert!(node.store.shielded_burn_nullifier(&nullifier, 2));
+        assert!(node.store.shielded_leaf_count() > 0);
+        assert!(node.store.shielded_pool_balance() > 0);
+        assert!(node.store.shielded_nullifier_seen(&nullifier));
+
+        node.store.reset_chain();
+
+        assert_eq!(node.store.shielded_leaf_count(), 0);
+        assert_eq!(node.store.shielded_pool_balance(), 0);
+        assert!(!node.store.shielded_nullifier_seen(&nullifier));
+        assert_eq!(node.store.shielded_last_sealed_count(), 0);
+        assert!(node.store.shielded_verifying_key().is_none());
+        std::env::remove_var("INAZ_SHIELDED_ACTIVATION");
+    }
+
+    #[test]
+    fn c12_snapshot_roundtrip_restores_shielded_state() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("INAZ_SHIELDED_ACTIVATION", "1");
+        let (node, kp) = net("c12f");
+        let n = note(8 * RAI_PER_INAZ);
+        shield(&node, &kp, &n, 0);
+        let expected_root = node.store.state_root_at(node.store.tip_height().unwrap());
+        let expected_vk = node.store.shielded_verifying_key();
+        let snap = snapshot::export(&node.store, 7777).unwrap();
+        let restored = Store::open(&tmp("c12g")).unwrap();
+
+        snapshot::import(&restored, &snap, 7777).unwrap();
+
+        assert_eq!(restored.shielded_leaves(), node.store.shielded_leaves());
+        assert_eq!(restored.shielded_pool_balance(), 8 * RAI_PER_INAZ);
+        assert_eq!(restored.shielded_last_sealed_count(), 1);
+        assert_eq!(restored.shielded_verifying_key(), expected_vk);
+        assert_eq!(restored.state_root_at(snap.height), expected_root);
+        std::env::remove_var("INAZ_SHIELDED_ACTIVATION");
+    }
 }

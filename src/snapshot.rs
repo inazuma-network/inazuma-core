@@ -40,6 +40,14 @@ pub struct Snapshot {
     #[serde(default)]
     pub at_rest_root: String,
     pub base_fee: String,
+    /// Shielded metadata lives outside the snapshot trees and must be restored
+    /// before rebuilding the consensus root.
+    #[serde(default)]
+    pub shielded_pool: String,
+    #[serde(default)]
+    pub shielded_sealed: u64,
+    #[serde(default)]
+    pub shielded_vk: String,
     pub block: Block,
     pub tables: Vec<Table>,
 }
@@ -98,6 +106,12 @@ pub fn export(store: &Store, chain_id: u64) -> Result<Snapshot, String> {
         state_root: block.state_root.clone(),
         at_rest_root: at_rest,
         base_fee: store.base_fee().to_string(),
+        shielded_pool: store.shielded_pool_balance().to_string(),
+        shielded_sealed: store.shielded_last_sealed_count(),
+        shielded_vk: store
+            .shielded_verifying_key()
+            .map(hex::encode)
+            .unwrap_or_default(),
         block,
         tables,
     })
@@ -137,6 +151,18 @@ pub fn import(store: &Store, snap: &Snapshot, chain_id: u64) -> Result<u64, Stri
         .base_fee
         .parse()
         .map_err(|_| "bad base fee".to_string())?;
+    let shielded_pool: u128 = if snap.shielded_pool.is_empty() {
+        0
+    } else {
+        snap.shielded_pool
+            .parse()
+            .map_err(|_| "bad shielded pool balance".to_string())?
+    };
+    let shielded_vk = if snap.shielded_vk.is_empty() {
+        None
+    } else {
+        Some(hex::decode(&snap.shielded_vk).map_err(|_| "bad shielded verifying key".to_string())?)
+    };
 
     store.reset_chain();
     for table in &snap.tables {
@@ -152,7 +178,12 @@ pub fn import(store: &Store, snap: &Snapshot, chain_id: u64) -> Result<u64, Stri
         }
     }
     store.set_base_fee(base_fee);
-    store.build_merkle_state();
+    store.shielded_set_pool_balance(shielded_pool);
+    store.shielded_set_last_sealed_count(snap.shielded_sealed);
+    if let Some(vk) = shielded_vk {
+        store.shielded_set_verifying_key(&vk);
+    }
+    store.build_merkle_state(snap.height);
 
     let rebuilt = store.state_root_at(snap.height);
     if rebuilt != expected_at_rest {

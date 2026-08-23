@@ -1,8 +1,9 @@
 <h1 align="center">Inazuma Core</h1>
 
 <p align="center">
-  A sovereign layer-1 blockchain written from scratch in Rust.<br/>
-  400 ms blocks · Ed25519 accounts · native tokens · WASM contracts · proof-carrying state.
+  <strong>Own it. Play it. Trade it. Instantly.</strong><br/>
+  The sovereign L1 for collectibles, games and communities.<br/>
+  400 ms blocks · Ed25519 accounts · native tokens · WASM contracts · shielded pool.
 </p>
 
 <p align="center">
@@ -13,9 +14,10 @@
 
 ---
 
-No Geth, no Cosmos SDK, no subnet framework. Our own block format, state machine,
-consensus loop, networking stack and JSON-RPC. **INAZ** is the native coin and the
-staking coin — nobody needs to hold another chain's token to validate.
+Mint a collection, run a game loop, or give a community its own token: confirmations land
+in 400 ms and cost fractions of a cent, and tokens, NFTs and staking are protocol features
+rather than contracts you have to deploy. **INAZ** is the native coin and the staking coin —
+nobody needs to hold another chain's token to validate.
 
 | | |
 | --- | --- |

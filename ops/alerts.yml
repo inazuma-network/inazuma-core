@@ -1,0 +1,32 @@
+groups:
+  - name: inazuma
+    rules:
+      - alert: ChainStalled
+        expr: increase(inazuma_block_height[2m]) == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations: { summary: "No new blocks for 2 minutes on {{ $labels.instance }}" }
+      - alert: FinalityLagging
+        expr: inazuma_finality_lag_blocks > 200
+        for: 5m
+        labels: { severity: critical }
+      - alert: NodeDown
+        expr: up{job="inazuma-nodes"} == 0
+        for: 1m
+        labels: { severity: critical }
+      - alert: NoPeers
+        expr: inazuma_peer_count == 0 and inazuma_solo_mode == 0
+        for: 5m
+        labels: { severity: warning }
+      - alert: MempoolBacklog
+        expr: inazuma_mempool_txs > 10000
+        for: 10m
+        labels: { severity: warning }
+      - alert: NodeHalted
+        expr: inazuma_halted == 1
+        labels: { severity: critical }
+      - alert: StateRootDivergence
+        expr: count(count by (state_root) (inazuma_state_root_info)) > 1
+        for: 1m
+        labels: { severity: critical }
+        annotations: { summary: "Nodes report different state roots — possible fork" }

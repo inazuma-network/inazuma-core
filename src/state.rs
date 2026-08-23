@@ -36,6 +36,12 @@ pub struct Store {
     slashes: Tree,
     /// Sparse Merkle tree nodes over all consensus state.
     smt_nodes: Tree,
+    /// Shielded pool note commitments, in append order: big-endian index -> hex Fr.
+    shielded_leaves: Tree,
+    /// Spent shielded nullifiers: hex Fr -> height it was burned at.
+    shielded_nulls: Tree,
+    /// Sealed shielded tree roots a spend may anchor to: hex root -> height.
+    shielded_roots: Tree,
     /// Undo log for the block currently executing (see `journal.rs`).
     journal: Journal,
 }
@@ -54,6 +60,9 @@ const T_CONTRACT_STORAGE: usize = 9;
 const T_RECEIPTS: usize = 10;
 const T_SLASHES: usize = 11;
 pub(crate) const T_SMT: usize = 12;
+const T_SHIELDED_LEAVES: usize = 13;
+const T_SHIELDED_NULLS: usize = 14;
+const T_SHIELDED_ROOTS: usize = 15;
 
 impl Store {
     pub fn open(path: &str) -> Result<Self, String> {
@@ -74,6 +83,15 @@ impl Store {
             receipts: db.open_tree("receipts").map_err(|e| e.to_string())?,
             slashes: db.open_tree("slashes").map_err(|e| e.to_string())?,
             smt_nodes: db.open_tree("smt").map_err(|e| e.to_string())?,
+            shielded_leaves: db
+                .open_tree("shielded_leaves")
+                .map_err(|e| e.to_string())?,
+            shielded_nulls: db
+                .open_tree("shielded_nulls")
+                .map_err(|e| e.to_string())?,
+            shielded_roots: db
+                .open_tree("shielded_roots")
+                .map_err(|e| e.to_string())?,
             journal: Journal::new(),
             _db: db,
         })
@@ -97,6 +115,9 @@ impl Store {
             &self.receipts,
             &self.slashes,
             &self.smt_nodes,
+            &self.shielded_leaves,
+            &self.shielded_nulls,
+            &self.shielded_roots,
         ]
     }
 
@@ -216,6 +237,133 @@ impl Store {
         }
     }
 
+    // ---- shielded pool ----
+
+    /// Number of note commitments ever appended (the next leaf's position).
+    pub fn shielded_leaf_count(&self) -> u64 {
+        self.shielded_leaves.len() as u64
+    }
+
+    /// Append a note commitment. Returns the position it landed at.
+    pub fn shielded_append(&self, commitment_hex: &str) -> u64 {
+        let pos = self.shielded_leaf_count();
+        self.jput(
+            T_SHIELDED_LEAVES,
+            &self.shielded_leaves,
+            &pos.to_be_bytes(),
+            commitment_hex.as_bytes(),
+        );
+        pos
+    }
+
+    /// All commitments in order, for tree/path computation off the hot path.
+    pub fn shielded_leaves(&self) -> Vec<String> {
+        self.shielded_leaves
+            .iter()
+            .filter_map(|kv| kv.ok())
+            .filter_map(|(_k, v)| String::from_utf8(v.to_vec()).ok())
+            .collect()
+    }
+
+    pub fn shielded_nullifier_seen(&self, nullifier_hex: &str) -> bool {
+        matches!(self.shielded_nulls.get(nullifier_hex.as_bytes()), Ok(Some(_)))
+    }
+
+    /// Burn a nullifier at `height`. Returns false if it was already spent.
+    pub fn shielded_burn_nullifier(&self, nullifier_hex: &str, height: u64) -> bool {
+        if self.shielded_nullifier_seen(nullifier_hex) {
+            return false;
+        }
+        self.jput(
+            T_SHIELDED_NULLS,
+            &self.shielded_nulls,
+            nullifier_hex.as_bytes(),
+            &height.to_be_bytes(),
+        );
+        true
+    }
+
+    /// Seal a tree root so spends may anchor to it.
+    pub fn shielded_seal_root(&self, root_hex: &str, height: u64) {
+        self.jput(
+            T_SHIELDED_ROOTS,
+            &self.shielded_roots,
+            root_hex.as_bytes(),
+            &height.to_be_bytes(),
+        );
+    }
+
+    pub fn shielded_root_known(&self, root_hex: &str) -> bool {
+        matches!(self.shielded_roots.get(root_hex.as_bytes()), Ok(Some(_)))
+    }
+
+    /// Public INAZ held by the pool: only moves via shield/unshield amounts.
+    pub fn shielded_pool_balance(&self) -> u128 {
+        self.meta
+            .get(b"shielded_pool")
+            .ok()
+            .flatten()
+            .and_then(|v| String::from_utf8(v.to_vec()).ok())
+            .and_then(|s| s.parse::<u128>().ok())
+            .unwrap_or(0)
+    }
+
+    pub fn shielded_set_pool_balance(&self, balance: u128) {
+        self.jput(
+            T_META,
+            &self.meta,
+            b"shielded_pool",
+            balance.to_string().as_bytes(),
+        );
+    }
+
+    /// Groth16 verifying key for the spend circuit, installed by the trusted
+    /// setup ceremony. Hex of the canonical arkworks serialization.
+    pub fn shielded_verifying_key(&self) -> Option<Vec<u8>> {
+        self.meta
+            .get(b"shielded_vk")
+            .ok()
+            .flatten()
+            .and_then(|v| hex::decode(v.to_vec()).ok())
+    }
+
+    pub fn shielded_set_verifying_key(&self, vk_bytes: &[u8]) {
+        self.jput(T_META, &self.meta, b"shielded_vk", hex::encode(vk_bytes).as_bytes());
+    }
+
+    /// Leaf count the last sealed root covers, so blocks without shielded
+    /// activity skip the tree recompute entirely.
+    pub fn shielded_last_sealed_count(&self) -> u64 {
+        self.meta
+            .get(b"shielded_sealed")
+            .ok()
+            .flatten()
+            .and_then(|v| String::from_utf8(v.to_vec()).ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0)
+    }
+
+    pub fn shielded_set_last_sealed_count(&self, count: u64) {
+        self.jput(
+            T_META,
+            &self.meta,
+            b"shielded_sealed",
+            count.to_string().as_bytes(),
+        );
+    }
+
+    /// Fold the shielded root and pool balance into the Merkle state, so the
+    /// block's state root covers the pool and an importer's root only matches
+    /// when its pool history is identical.
+    pub fn shielded_seal_into_state(&self, root_hex: &str) {
+        let smt = self.smt();
+        smt.set("shielded", b"root", Some(root_hex.as_bytes()));
+        let pool = self.shielded_pool_balance().to_string();
+        smt.set("shielded", b"pool", Some(pool.as_bytes()));
+        let nulls = self.shielded_nulls_digest();
+        smt.set("shielded", b"nulls", Some(nulls.as_bytes()));
+    }
+
     fn account_leaf(acct: &Account) -> Vec<u8> {
         // Same fields the legacy digest covered: penalties stay out of the root
         // because they are derived from block history, not from transactions.
@@ -244,7 +392,7 @@ impl Store {
 
     /// Build the Merkle tree from current state. Runs once per database, and
     /// again after a reorg wipe, so an upgrading node catches up without a resync.
-    pub fn build_merkle_state(&self) {
+    pub fn build_merkle_state(&self, height: u64) {
         let smt = self.smt();
         smt.clear();
         for item in self.accounts.iter().flatten() {
@@ -267,6 +415,15 @@ impl Store {
         }
         for item in self.contract_storage.iter().flatten() {
             smt.set("cstorage", &item.0, Some(&item.1));
+        }
+        if height >= crate::shielded::activation_height() {
+            let leaves: Vec<_> = self
+                .shielded_leaves()
+                .iter()
+                .filter_map(|value| crate::poseidon::fr_from_hex(value))
+                .collect();
+            let root = crate::poseidon::fr_to_hex(&crate::shielded::root_from_leaves(&leaves));
+            self.shielded_seal_into_state(&root);
         }
         let _ = self.smt_nodes.flush();
         self.jput(T_META, &self.meta, b"smt_version", b"1");
@@ -655,7 +812,39 @@ impl Store {
                 buf.extend_from_slice(b"|");
             }
         }
+        // Shielded pool: covered like every other table, otherwise two nodes
+        // could diverge on leaves/nullifiers/pool balance while agreeing on
+        // the state root. The v1 digest predates shielded activation on
+        // mainnet configs, but devnets activate it well below the v2 switch.
+        let leaves = self.shielded_leaves();
+        let frs: Vec<_> = leaves
+            .iter()
+            .filter_map(|h| crate::poseidon::fr_from_hex(h))
+            .collect();
+        buf.extend_from_slice(b"shielded|");
+        buf.extend_from_slice(
+            crate::poseidon::fr_to_hex(&crate::shielded::root_from_leaves(&frs)).as_bytes(),
+        );
+        buf.extend_from_slice(b"|");
+        buf.extend_from_slice(self.shielded_pool_balance().to_string().as_bytes());
+        buf.extend_from_slice(b"|");
+        buf.extend_from_slice(self.shielded_nulls_digest().as_bytes());
+        buf.extend_from_slice(b"|");
         hex::encode(sha256(&buf))
+    }
+
+    /// Deterministic digest of the spent-nullifier set. Part of the state
+    /// root so two nodes cannot disagree on which notes are burned while
+    /// agreeing on everything else.
+    pub fn shielded_nulls_digest(&self) -> String {
+        let mut buf = Vec::new();
+        for kv in self.shielded_nulls.iter().flatten() {
+            buf.extend_from_slice(&kv.0);
+            buf.push(b'=');
+            buf.extend_from_slice(&kv.1);
+            buf.push(b'|');
+        }
+        crate::crypto::hash_hex(&buf)
     }
 
     pub fn total_supply(&self) -> u128 {
@@ -832,6 +1021,18 @@ impl Store {
         let _ = self.receipts.clear();
         let _ = self.slashes.clear();
         let _ = self.smt_nodes.clear();
+        // Shielded pool state is part of the chain: leaving it behind after a
+        // wipe double-counts the pool on replay and burns nullifiers that the
+        // winning fork needs, permanently forking the node.
+        let _ = self.shielded_leaves.clear();
+        let _ = self.shielded_nulls.clear();
+        let _ = self.shielded_roots.clear();
+        let _ = self.meta.remove(b"shielded_pool");
+        let _ = self.meta.remove(b"shielded_sealed");
+        let _ = self.meta.remove(b"shielded_vk");
+        let _ = self.shielded_leaves.flush();
+        let _ = self.shielded_nulls.flush();
+        let _ = self.shielded_roots.flush();
         let _ = self.meta.remove(b"tip_height");
         let _ = self.meta.remove(b"tip_hash");
         let _ = self.meta.remove(b"state_checkpoint");
@@ -858,6 +1059,9 @@ pub const SNAPSHOT_TABLES: &[&str] = &[
     "contract_code",
     "contract_storage",
     "slashes",
+    "shielded_leaves",
+    "shielded_nulls",
+    "shielded_roots",
 ];
 
 impl Store {
@@ -872,6 +1076,9 @@ impl Store {
             "contract_storage" => &self.contract_storage,
             "slashes" => &self.slashes,
             "receipts" => &self.receipts,
+            "shielded_leaves" => &self.shielded_leaves,
+            "shielded_nulls" => &self.shielded_nulls,
+            "shielded_roots" => &self.shielded_roots,
             _ => return None,
         })
     }

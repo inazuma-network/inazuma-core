@@ -1,0 +1,37 @@
+# Alertmanager: turns the Prometheus rules in alerts.yml into a page.
+# Set the webhook URLs as env vars and start with:
+#   alertmanager --config.file=ops/alertmanager.yml
+route:
+  receiver: oncall
+  group_by: [alertname]
+  group_wait: 10s
+  group_interval: 1m
+  repeat_interval: 30m
+  routes:
+    - matchers: [severity="critical"]
+      receiver: oncall
+      group_wait: 0s
+      repeat_interval: 10m
+
+receivers:
+  - name: oncall
+    # Discord accepts Slack-format payloads at <webhook>/slack
+    slack_configs:
+      - api_url_file: /etc/alertmanager/discord_webhook_slack_url
+        channel: "#inazuma-oncall"
+        send_resolved: true
+        title: '{{ .CommonLabels.severity | toUpper }} {{ .CommonLabels.alertname }}'
+        text: >-
+          {{ range .Alerts }}{{ .Annotations.summary }}{{ if not .Annotations.summary }}{{ .Labels.alertname }}{{ end }}
+          — instance {{ .Labels.instance }}
+          {{ end }}
+    # Fallback / extra sink: any HTTP endpoint (e.g. the Telegram relay).
+    webhook_configs:
+      - url_file: /etc/alertmanager/generic_webhook_url
+        send_resolved: true
+
+inhibit_rules:
+  # A downed node explains its own stall; don't double-page.
+  - source_matchers: [alertname="NodeDown"]
+    target_matchers: [alertname="ChainStalled"]
+    equal: [instance]

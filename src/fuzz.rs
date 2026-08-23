@@ -243,6 +243,7 @@ fn random_tx(rng: &mut Rng, pubkey: &str) -> Transaction {
         chain_id: rng.below(3),
         payload,
         signature: String::new(),
+        shielded: None,
     }
 }
 

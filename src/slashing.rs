@@ -21,7 +21,7 @@ use crate::state::Store;
 use crate::types::{
     Block, Payload, DOWNTIME_JAIL_BLOCKS, DOWNTIME_JAIL_STREAK, DOWNTIME_REPEAT_BURN_BPS,
     EQUIVOCATION_CORRELATION_FACTOR, EQUIVOCATION_MIN_BURN_PCT, EVIDENCE_MAX_AGE_BLOCKS,
-    REPORTER_BOUNTY_PCT, SLASHING_ACTIVATION_HEIGHT, TOMBSTONE_HEIGHT,
+    REPORTER_BOUNTY_PCT, TOMBSTONE_HEIGHT,
 };
 use serde::{Deserialize, Serialize};
 
@@ -30,6 +30,7 @@ use serde::{Deserialize, Serialize};
 pub struct HeaderProof {
     pub height: u64,
     pub parent_hash: String,
+    #[serde(with = "crate::types::u128_str")]
     pub timestamp_ms: u128,
     pub state_root: String,
     pub txs_root: String,
@@ -342,7 +343,7 @@ pub fn apply_unjail(store: &Store, height: u64, address: &str) -> Result<(), Str
 /// Derived purely from `(height, parent_hash, producer)`, so a node replaying
 /// history reaches exactly the same liveness ledger as one that was online.
 pub fn record_liveness(store: &Store, height: u64, parent_hash: &str, producer: &str) {
-    if height < SLASHING_ACTIVATION_HEIGHT {
+    if height < crate::types::slashing_activation() {
         return;
     }
     let set = crate::staking::validator_set_at(store, height);
@@ -399,8 +400,7 @@ pub fn record_liveness(store: &Store, height: u64, parent_hash: &str, producer: 
                 }
             }
             store.set_account(&address, &acct);
-        } else if acct.penalties.missed_streak >= DOWNTIME_JAIL_STREAK
-            && !acct.penalties.tombstoned
+        } else if acct.penalties.missed_streak >= DOWNTIME_JAIL_STREAK && !acct.penalties.tombstoned
         {
             acct.penalties.missed_streak = 0;
             acct.penalties.downtime_jails += 1;
@@ -496,7 +496,10 @@ mod tests {
             && !p.jail_fault
             && !p.tombstoned
             && p.jailed_until != TOMBSTONE_HEIGHT;
-        assert!(!clear, "equivocation jail must never be cleared by producing");
+        assert!(
+            !clear,
+            "equivocation jail must never be cleared by producing"
+        );
         p.jail_fault = false;
         let clear = !crate::types::downtime_jail_enabled(post)
             && p.jailed_until != 0
@@ -514,7 +517,8 @@ mod tests {
         // Every later rule change must be gated strictly above the deploy height,
         // so no future fork can be retroactive the way this one was.
         assert!(
-            crate::types::INACTIVITY_LEAK_ACTIVATION_HEIGHT > crate::types::RETRO_FORK_DEPLOY_HEIGHT
+            crate::types::INACTIVITY_LEAK_ACTIVATION_HEIGHT
+                > crate::types::RETRO_FORK_DEPLOY_HEIGHT
         );
         assert!(!crate::types::inactivity_leak_enabled(
             crate::types::INACTIVITY_LEAK_ACTIVATION_HEIGHT - 1
@@ -628,5 +632,36 @@ mod tests {
         assert_eq!(equivocation_burn_pct(40_000, 100_000), 100);
         // 10% share -> 30% burn.
         assert_eq!(equivocation_burn_pct(10_000, 100_000), 30);
+    }
+}
+
+#[cfg(test)]
+mod evidence_wire_tests {
+    use super::*;
+
+    /// Regression: `HeaderProof.timestamp_ms` is a u128 inside an internally
+    /// tagged enum. Serializing worked but parsing failed with "u128 is not
+    /// supported", so double-sign evidence could be produced and gossiped yet
+    /// never accepted — equivocation was effectively unslashable on a live net.
+    #[test]
+    fn block_evidence_survives_a_round_trip() {
+        let a = HeaderProof {
+            height: 42,
+            parent_hash: "aa".into(),
+            timestamp_ms: 1_777_000_000_123,
+            state_root: "bb".into(),
+            txs_root: "cc".into(),
+            producer: "prod".into(),
+            producer_pubkey: "dd".into(),
+            signature: "ee".into(),
+            hash: "ff".into(),
+        };
+        let mut b = a.clone();
+        b.timestamp_ms += 1;
+        b.hash = "f0".into();
+        let ev = Evidence::Block { a, b };
+        let back = decode(&Some(encode(&ev))).expect("evidence must decode");
+        assert_eq!(back.height(), 42);
+        assert_eq!(back.label(), "double-sign");
     }
 }

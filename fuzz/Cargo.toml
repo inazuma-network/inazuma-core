@@ -1,0 +1,40 @@
+[package]
+name = "inazuma-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1"
+
+[dependencies.inazuma-core]
+path = ".."
+
+# Keep debug assertions on: an arithmetic overflow reachable from an
+# unauthenticated peer is exactly the bug class we are hunting.
+[profile.release]
+debug = 1
+debug-assertions = true
+overflow-checks = true
+
+[[bin]]
+name = "p2p_wire"
+path = "fuzz_targets/p2p_wire.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "p2p_frame"
+path = "fuzz_targets/p2p_frame.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "tx_decode"
+path = "fuzz_targets/tx_decode.rs"
+test = false
+doc = false

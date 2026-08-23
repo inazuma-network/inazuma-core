@@ -89,3 +89,14 @@ inazuma-tx|<chainId>|<kind>|<fromPubkey>|<to>|<amount>|<fee>|<nonce>
 
 `kind` is one of `transfer`, `stake`, `unstake`, `token-create`, `token-send`,
 `token-mint`, `token-burn`.
+
+## Monitoring endpoints
+
+Both are plain `GET`, no API key, and never expose peer addresses or node keys.
+
+| Path | Returns |
+| --- | --- |
+| `/health` | `{"ok":true,"height":<n>}` — liveness probe |
+| `/metrics` | Prometheus text format: height, finalized height, finality lag, peers, mempool, validators, accounts, tx counter, tokens, contracts, pruned floor, halted flag, base fee, supply, total staked, plus `inazuma_state_root_info{height,state_root,tip_hash,chain_id}` for cross-node fork detection |
+
+Scrape config, alert rules and a Grafana dashboard live in `ops/`.

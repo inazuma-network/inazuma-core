@@ -1,7 +1,7 @@
 # Architecture
 
-Inazuma Core is a single Rust binary. No Geth, no Cosmos SDK, no Avalanche subnet —
-our own block format, state machine, consensus loop, networking and RPC.
+Inazuma Core is a single binary containing the block format, state machine, consensus
+loop, networking and RPC.
 
 ```
 src/crypto.rs      keys, addresses, signing, hashing (Ed25519, domain-separated)

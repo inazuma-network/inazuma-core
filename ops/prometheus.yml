@@ -1,0 +1,11 @@
+# Scrape config for the Inazuma testnet. Each node exposes /metrics on its RPC
+# port with no auth and no topology data.
+global:
+  scrape_interval: 15s
+scrape_configs:
+  - job_name: inazuma-nodes
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["node1:9933", "node2:9933", "node3:9933"]
+        labels: { network: testnet }
+rule_files: ["alerts.yml"]

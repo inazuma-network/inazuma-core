@@ -187,7 +187,11 @@ fn sync_rate_eta(height: u64, target: u64) -> (f64, String) {
         let inst = (height - prev_h) as f64 / dt;
         let old = RATE_MILLI.load(Ordering::Relaxed) as f64 / 1000.0;
         // Exponential smoothing keeps the ETA readable instead of jittering.
-        let smoothed = if old > 0.0 { old * 0.7 + inst * 0.3 } else { inst };
+        let smoothed = if old > 0.0 {
+            old * 0.7 + inst * 0.3
+        } else {
+            inst
+        };
         RATE_MILLI.store((smoothed * 1000.0) as u64, Ordering::Relaxed);
     }
     let rate = RATE_MILLI.load(Ordering::Relaxed) as f64 / 1000.0;
@@ -305,7 +309,12 @@ pub fn status_table(rows: &[StatusRow]) {
 
 /// Copy-paste command cheatsheet, so stake management needs no docs lookup.
 pub fn commands(staked: bool) {
-    println!("  {}{}Commands — copy & paste{}", c(BOLD), c(MAGENTA), c(RESET));
+    println!(
+        "  {}{}Commands — copy & paste{}",
+        c(BOLD),
+        c(MAGENTA),
+        c(RESET)
+    );
     let list: &[(&str, &str)] = if staked {
         &[
             ("inazuma wallet", "address, balance, stake, points"),
@@ -318,8 +327,14 @@ pub fn commands(staked: bool) {
         &[
             ("inazuma wallet", "address, balance, stake, points"),
             ("inazuma wallet-new", "create a fresh validator wallet"),
-            ("inazuma wallet-import --key <hex>", "import an existing wallet"),
-            ("inazuma stake --amount 1000", "join the validator set (min 1000 INAZ)"),
+            (
+                "inazuma wallet-import --key <hex>",
+                "import an existing wallet",
+            ),
+            (
+                "inazuma stake --amount 1000",
+                "join the validator set (min 1000 INAZ)",
+            ),
             ("inazuma status", "chain height, peers, validator set"),
         ]
     };

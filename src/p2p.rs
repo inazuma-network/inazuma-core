@@ -32,8 +32,47 @@ static SYNC_GATE: Mutex<()> = Mutex::new(());
 /// Unix seconds of the last genesis replay, so a node that keeps diverging
 /// cannot spin in a reset loop and never finish syncing.
 static LAST_RESET: AtomicU64 = AtomicU64::new(0);
-/// A full replay is expensive; never start another within this window.
+/// A full replay is expensive; never start another within this window — unless
+/// the node is provably stuck (see `may_resolve_fork`).
 const RESET_COOLDOWN_SECS: u64 = 900;
+/// How long a node may sit at the same height, unable to import, before the
+/// cooldown is overridden. A stalled node is already useless; refusing to
+/// re-resolve only makes the stall permanent.
+const STALL_OVERRIDE_SECS: u64 = 90;
+/// Hard ceiling on overrides, so a genuinely hostile peer set cannot make a node
+/// replay from genesis in a loop.
+const MAX_STALL_OVERRIDES: u64 = 3;
+static STALL_OVERRIDES: AtomicU64 = AtomicU64::new(0);
+/// Unix seconds of the last successful block import, used to detect the stall.
+static LAST_IMPORT: AtomicU64 = AtomicU64::new(0);
+
+/// Note forward progress. Called on every accepted block from any path.
+pub fn note_import() {
+    LAST_IMPORT.store(now_secs(), Ordering::Relaxed);
+}
+
+/// A full genesis replay is allowed when the cooldown has expired, or when this
+/// node has imported nothing for `STALL_OVERRIDE_SECS` and still has overrides
+/// left. Without the stall path, a second fork inside the cooldown window left
+/// honest nodes wedged at "parent hash mismatch" forever.
+fn may_resolve_fork() -> bool {
+    let now = now_secs();
+    if now.saturating_sub(LAST_RESET.load(Ordering::Relaxed)) > RESET_COOLDOWN_SECS {
+        STALL_OVERRIDES.store(0, Ordering::Relaxed);
+        return true;
+    }
+    let last_import = LAST_IMPORT.load(Ordering::Relaxed);
+    let stalled = last_import > 0 && now.saturating_sub(last_import) > STALL_OVERRIDE_SECS;
+    if stalled && STALL_OVERRIDES.load(Ordering::Relaxed) < MAX_STALL_OVERRIDES {
+        STALL_OVERRIDES.fetch_add(1, Ordering::Relaxed);
+        eprintln!(
+            "[fork] stalled for {}s inside the replay cooldown; resolving anyway",
+            now.saturating_sub(last_import)
+        );
+        return true;
+    }
+    false
+}
 
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -55,6 +94,13 @@ const COST_PLAINTEXT: i32 = 4;
 /// Eclipse resistance: no single host may occupy more than this many inbound
 /// slots, so one machine cannot fill the table with sybil connections.
 const P2P_MAX_CONNS_PER_IP: usize = 8;
+/// Most votes served in one `getvotes` reply. Votes are tiny; this is ~2
+/// minutes of finality traffic for a 100-validator set.
+const MAX_VOTE_SYNC_BATCH: usize = 4_096;
+/// Vote rejects are logged sparsely: a broken peer must not be able to fill
+/// the disk by spamming bad votes, but a silent drop hid the live-net
+/// finality stall once already.
+static VOTE_REJECTS: AtomicU64 = AtomicU64::new(0);
 
 pub struct P2p {
     pub listen: String,
@@ -367,7 +413,14 @@ fn handle_conn(
     Ok(())
 }
 
-fn handle_msg(node: &Arc<Node>, p2p: &Arc<P2p>, msg: &Value, ip: Option<IpAddr>) -> Option<Value> {
+/// Dispatch one decoded peer message. `pub` so the wire fuzzer can reach it:
+/// this is the first place attacker-controlled structure meets node state.
+pub fn handle_msg(
+    node: &Arc<Node>,
+    p2p: &Arc<P2p>,
+    msg: &Value,
+    ip: Option<IpAddr>,
+) -> Option<Value> {
     match msg.get("t").and_then(|t| t.as_str()).unwrap_or("") {
         "status" => Some(json!({
             "t": "statusres",
@@ -418,10 +471,32 @@ fn handle_msg(node: &Arc<Node>, p2p: &Arc<P2p>, msg: &Value, ip: Option<IpAddr>)
                 Err(e) => {
                     if e.starts_with("equivocating vote") {
                         flush_vote_evidence(node, p2p);
+                    } else {
+                        // Never silent again: the multi-region finality stall
+                        // was invisible precisely because rejects were dropped.
+                        let n = VOTE_REJECTS.fetch_add(1, Ordering::Relaxed) + 1;
+                        if n <= 10 || n % 500 == 0 {
+                            eprintln!(
+                                "[vote] rejected #{} from {}…: {} (total {})",
+                                vote.height,
+                                &vote.voter_pubkey[..8.min(vote.voter_pubkey.len())],
+                                e,
+                                n
+                            );
+                        }
                     }
                 }
             }
             None
+        }
+        // Finality reconciliation: votes are fire-and-forget gossip with no
+        // guaranteed delivery, and on a small validator set EVERY vote is
+        // required (2/3 of 3 equal stakes is not strictly greater). Blocks
+        // already have getblocks; this is the same safety net for precommits.
+        "getvotes" => {
+            let from = msg.get("from").and_then(|v| v.as_u64()).unwrap_or(0);
+            let votes = node.votes.votes_above(from, MAX_VOTE_SYNC_BATCH);
+            Some(json!({ "t": "votes", "votes": votes }))
         }
         "evidence" => {
             let evidence: Evidence = serde_json::from_value(msg.get("evidence").cloned()?).ok()?;
@@ -444,6 +519,7 @@ fn handle_msg(node: &Arc<Node>, p2p: &Arc<P2p>, msg: &Value, ip: Option<IpAddr>)
                         block.height,
                         block.transactions.len()
                     );
+                    note_import();
                     vote_on(node, p2p, &block);
                     p2p.broadcast(&json!({ "t": "block", "block": block }));
                 }
@@ -524,6 +600,7 @@ pub fn sync_once(node: &Arc<Node>, p2p: &Arc<P2p>) {
             match node.import_block(&b) {
                 Ok(true) => {
                     println!("[sync] block #{} from {}", b.height, peer);
+                    note_import();
                     vote_on(node, p2p, &b);
                 }
                 Ok(false) => {}
@@ -534,12 +611,42 @@ pub fn sync_once(node: &Arc<Node>, p2p: &Arc<P2p>) {
                     // both sides pick the same branch without negotiating.
                     if e.contains("parent hash mismatch")
                         && should_adopt(node, &b, peer_height)
-                        && now_secs().saturating_sub(LAST_RESET.load(Ordering::Relaxed))
-                            > RESET_COOLDOWN_SECS
+                        && may_resolve_fork()
                     {
                         resolve_fork(node, p2p, peer, peer_height);
                     }
                     break;
+                }
+            }
+        }
+    }
+}
+
+/// Pull any precommits this node missed from every peer and count them.
+/// Gossip has no delivery guarantee; this is the periodic reconciliation that
+/// makes finality robust to dropped, rate-limited or evicted votes. Runs from
+/// the main loop's heartbeat and after every block catch-up.
+pub fn sync_votes(node: &Arc<Node>, p2p: &Arc<P2p>) {
+    if node.solo() {
+        return;
+    }
+    // Everything at or below our finalized height is settled; ask only for
+    // what could still be new.
+    let from = node.store.finalized_height();
+    for peer in &p2p.peers {
+        let res = match p2p.request(peer, &json!({ "t": "getvotes", "from": from })) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let votes: Vec<Vote> = res
+            .get("votes")
+            .cloned()
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_default();
+        for vote in votes {
+            if let Ok(outcome) = node.votes.add(&node.store, vote) {
+                if let Some(h) = outcome.finalized {
+                    println!("[final] height {} finalized (via vote sync)", h);
                 }
             }
         }

@@ -4,6 +4,15 @@ version = "0.1.1"
 edition = "2021"
 description = "Inazuma L1 — a from-scratch blockchain node. INAZ is the native and staking coin."
 
+[lib]
+name = "inazuma_core"
+path = "src/lib.rs"
+
+[features]
+# Builds a deliberately malicious node used only in adversarial network tests.
+# Never enable for a real validator: it double-signs on purpose.
+byzantine = []
+
 [[bin]]
 name = "inazuma"
 path = "src/main.rs"
@@ -24,6 +33,16 @@ chacha20poly1305 = "0.10"
 hkdf = "0.12"
 qrcode = { version = "0.14.1", default-features = false }
 ureq = { version = "2.12", default-features = false, features = ["tls"] }
+
+# Shielded pool: Groth16 over BN254 with Poseidon in-circuit hashing.
+ark-bn254 = "0.4"
+ark-ff = "0.4"
+ark-ec = "0.4"
+ark-groth16 = "0.4"
+ark-relations = "0.4"
+ark-r1cs-std = "0.4"
+ark-serialize = "0.4"
+ark-std = "0.4"
 
 [profile.release]
 opt-level = 3

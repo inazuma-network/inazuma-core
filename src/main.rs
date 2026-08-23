@@ -1,4 +1,4 @@
-//! Inazuma node — a blockchain written from scratch. INAZ is the native coin.
+//! Inazuma node — the L1 for collectibles, games and communities. INAZ is the native coin.
 //!
 //! Commands:
 //!   inazuma keygen
@@ -7,36 +7,12 @@
 //!   inazuma send   --rpc <url> --key <hex> --to <addr> --amount <INAZ>
 //!   inazuma balance --rpc <url> --address <addr>
 
-#[cfg(test)]
-mod battletest;
-mod chain;
-mod conformance;
-mod consensus;
-mod contracts;
-mod crypto;
-mod events;
-mod fees;
-mod fuzz;
-mod journal;
-mod limits;
-mod log;
-mod mempool;
-mod p2p;
-mod qos;
-mod rpc;
-mod rpcauth;
-mod simulate;
-mod signguard;
-mod slashing;
-mod smt;
-mod snapshot;
-mod staking;
-mod state;
-mod tokens;
-mod transport;
-mod types;
-mod ui;
-mod ws;
+#[cfg(feature = "byzantine")]
+use inazuma_core::byzantine;
+use inazuma_core::{
+    chain, contracts, crypto, log, p2p, qos, rpc, rpcauth, signguard, snapshot, state, tokens,
+    types, ui, ws,
+};
 
 use chain::Node;
 use crypto::Keypair;
@@ -45,9 +21,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use types::{format_inaz, parse_inaz, Genesis, Payload, Transaction, TxKind, CHAIN_ID, MIN_FEE};
 
-/// Blocks of history a pruning node keeps behind the finalized height.
-/// ~2 days at 400 ms blocks: enough for peers to catch up, small on disk.
-pub const DEFAULT_PRUNE_KEEP: u64 = 400_000;
+use inazuma_core::DEFAULT_PRUNE_KEEP;
 
 fn args() -> (String, HashMap<String, String>) {
     let raw: Vec<String> = std::env::args().skip(1).collect();
@@ -77,7 +51,13 @@ fn args() -> (String, HashMap<String, String>) {
 
 fn load_genesis(path: &str, flags: &HashMap<String, String>) -> Result<Genesis, String> {
     if let Ok(text) = std::fs::read_to_string(path) {
-        return serde_json::from_str(&text).map_err(|e| format!("bad genesis: {}", e));
+        let g: Genesis = serde_json::from_str(&text).map_err(|e| format!("bad genesis: {}", e))?;
+        // Slashing activation is chain identity: read it once, here, before any
+        // block is executed, so every node on this genesis agrees on it.
+        if let Some(h) = g.slashing_activation_height {
+            types::set_slashing_activation(h);
+        }
+        return Ok(g);
     }
     let admin = flags.get("admin").cloned().ok_or_else(|| {
         format!(
@@ -125,6 +105,260 @@ fn run() -> Result<(), String> {
         "address" => {
             let kp = Keypair::from_secret_hex(flags.get("key").ok_or("--key required")?)?;
             println!("{}", kp.address());
+            Ok(())
+        }
+
+        /// Full shielded-pool round trip against a live node:
+        /// shield two notes, private transfer, unshield to a fresh address.
+        /// `inazuma shielded-demo --rpc <url> --key <hex> [--amount <INAZ>]`
+        "shielded-demo" => {
+            use ark_bn254::Fr;
+            use inazuma_core::{poseidon as pose, shielded as sh, shielded_circuit as sc};
+            use types::ShieldedData;
+
+            let rpc_url = flags
+                .get("rpc")
+                .cloned()
+                .unwrap_or_else(|| "127.0.0.1:19331".into());
+            let kp = Keypair::from_secret_hex(flags.get("key").ok_or("--key required")?)?;
+            let amount_inaz: u128 = flags
+                .get("amount")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(2);
+            let amount = amount_inaz * types::RAI_PER_INAZ;
+
+            let fr_rand = || -> Fr {
+                let mut b = [0u8; 16];
+                getrandom::getrandom(&mut b).expect("os rng");
+                pose::hash2(
+                    Fr::from(u64::from_le_bytes(b[..8].try_into().unwrap())),
+                    Fr::from(u64::from_le_bytes(b[8..].try_into().unwrap())),
+                )
+            };
+
+            struct Note {
+                sk: Fr,
+                value: u128,
+                rho: Fr,
+            }
+            impl Note {
+                fn new(value: u128, f: &dyn Fn() -> Fr) -> Note {
+                    Note { sk: f(), value, rho: f() }
+                }
+                fn cm(&self) -> String {
+                    pose::fr_to_hex(&sh::note_commitment(sh::owner_tag(self.sk), self.value, self.rho))
+                }
+            }
+
+            let info = rpc_call(&rpc_url, "inaz_shieldedInfo", serde_json::json!({}))?;
+            if !info["active"].as_bool().unwrap_or(false) {
+                return Err(format!(
+                    "shielded pool not active yet (tip {}, activation {})",
+                    info["height"], info["activationHeight"]
+                ));
+            }
+            println!(
+                "[demo] pool active: {} notes, pool {} rai, root {}",
+                info["noteCount"], info["poolBalance"], info["treeRoot"]
+            );
+            println!("[demo] generating devnet Groth16 parameters...");
+            let t0 = std::time::Instant::now();
+            let (pk, _vk) = sc::devnet_setup();
+            println!("[demo] params ready in {:.1?}", t0.elapsed());
+
+            let acct = rpc_call(
+                &rpc_url,
+                "inaz_getAccount",
+                serde_json::json!({ "address": kp.address() }),
+            )?;
+            let mut nonce = acct["pendingNonce"]
+                .as_u64()
+                .or_else(|| acct["nonce"].as_u64())
+                .unwrap_or(0);
+            let base = info["noteCount"].as_u64().unwrap_or(0);
+
+            let wait_notes = |want: u64| -> Result<(), String> {
+                for _ in 0..120 {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    let i = rpc_call(&rpc_url, "inaz_shieldedInfo", serde_json::json!({}))?;
+                    if i["noteCount"].as_u64().unwrap_or(0) >= want {
+                        return Ok(());
+                    }
+                }
+                Err(format!("timed out waiting for note count {}", want))
+            };
+
+            let submit = |tx: &Transaction| -> Result<(), String> {
+                rpc_call(&rpc_url, "inaz_sendTransaction", serde_json::json!({ "tx": tx }))?;
+                Ok(())
+            };
+
+            // ---- 1. shield two notes -------------------------------------
+            let note_a = Note::new(amount, &fr_rand);
+            let note_b = Note::new(amount, &fr_rand);
+            for (label, n) in [("A", &note_a), ("B", &note_b)] {
+                let data = ShieldedData { commitments: vec![n.cm()], ..Default::default() };
+                let mut tx = Transaction {
+                    kind: TxKind::Shield,
+                    from_pubkey: kp.pubkey_hex(),
+                    to: kp.address(),
+                    amount: n.value,
+                    fee: MIN_FEE,
+                    nonce,
+                    chain_id: CHAIN_ID,
+                    payload: None,
+                    shielded: Some(data),
+                    signature: String::new(),
+                };
+                tx.signature = kp.sign_hex(&tx.canonical_signing_bytes());
+                submit(&tx)?;
+                println!("[demo] shield {} ({} INAZ) submitted (nonce {})", label, amount_inaz, nonce);
+                nonce += 1;
+            }
+            wait_notes(base + 2)?;
+            let (pa, pb) = (base, base + 1);
+            println!("[demo] shielded notes at tree positions {} and {}", pa, pb);
+
+            // ---- spend builder -------------------------------------------
+            let build_spend = |kind: TxKind,
+                               inputs: [(&Note, u64); 2],
+                               outputs: [sc::OutputNote; 2],
+                               public_unshield: u128,
+                               to: &str,
+                               nonce: u64|
+             -> Result<Transaction, String> {
+                let info = rpc_call(&rpc_url, "inaz_shieldedInfo", serde_json::json!({}))?;
+                let anchor = pose::fr_from_hex(info["treeRoot"].as_str().ok_or("no treeRoot")?)
+                    .ok_or("bad treeRoot")?;
+                let mut notes: Vec<sc::SpendNote> = Vec::new();
+                for (n, pos) in &inputs {
+                    let path = if n.value == 0 {
+                        (0..sh::TREE_DEPTH).map(sh::zero_subtree_root).collect::<Vec<_>>()
+                    } else {
+                        let p = rpc_call(
+                            &rpc_url,
+                            "inaz_shieldedPath",
+                            serde_json::json!({ "position": pos }),
+                        )?;
+                        if p["root"].as_str() != info["treeRoot"].as_str() {
+                            return Err("tree moved while building proof; retry".into());
+                        }
+                        p["path"]
+                            .as_array()
+                            .ok_or("no path")?
+                            .iter()
+                            .map(|h| pose::fr_from_hex(h.as_str().unwrap_or("")).ok_or("bad path element".to_string()))
+                            .collect::<Result<Vec<_>, _>>()?
+                    };
+                    notes.push(sc::SpendNote {
+                        spend_key: n.sk,
+                        value: n.value,
+                        rho: n.rho,
+                        position: *pos,
+                        path,
+                    });
+                }
+                let circuit = sc::SpendCircuit {
+                    anchor,
+                    nullifiers: [
+                        sh::nullifier(inputs[0].0.sk, inputs[0].1),
+                        sh::nullifier(inputs[1].0.sk, inputs[1].1),
+                    ],
+                    out_commitments: [
+                        sh::note_commitment(outputs[0].owner, outputs[0].value, outputs[0].rho),
+                        sh::note_commitment(outputs[1].owner, outputs[1].value, outputs[1].rho),
+                    ],
+                    public_unshield,
+                    inputs: [notes.remove(0), notes.remove(0)],
+                    outputs,
+                };
+                let tp = std::time::Instant::now();
+                let proof = sc::prove(&pk, circuit.clone())?;
+                println!("[demo] proof generated in {:.1?}", tp.elapsed());
+                let data = ShieldedData {
+                    anchor: pose::fr_to_hex(&anchor),
+                    nullifiers: circuit.nullifiers.iter().map(pose::fr_to_hex).collect(),
+                    commitments: circuit.out_commitments.iter().map(pose::fr_to_hex).collect(),
+                    proof: sc::proof_to_hex(&proof),
+                    public_unshield: if public_unshield > 0 {
+                        public_unshield.to_string()
+                    } else {
+                        String::new()
+                    },
+                };
+                let mut tx = Transaction {
+                    kind,
+                    from_pubkey: kp.pubkey_hex(),
+                    to: to.to_string(),
+                    amount: 0,
+                    fee: MIN_FEE,
+                    nonce,
+                    chain_id: CHAIN_ID,
+                    payload: None,
+                    shielded: Some(data),
+                    signature: String::new(),
+                };
+                tx.signature = kp.sign_hex(&tx.canonical_signing_bytes());
+                Ok(tx)
+            };
+
+            // ---- 2. private transfer: A+B -> bob(amount) + change(amount) -
+            let bob_sk = fr_rand();
+            let out_bob = sc::OutputNote { owner: sh::owner_tag(bob_sk), value: amount, rho: fr_rand() };
+            let out_change = sc::OutputNote { owner: sh::owner_tag(fr_rand()), value: amount, rho: fr_rand() };
+            let tx = build_spend(
+                TxKind::PrivateTransfer,
+                [(&note_a, pa), (&note_b, pb)],
+                [out_bob.clone(), out_change],
+                0,
+                "",
+                nonce,
+            )?;
+            submit(&tx)?;
+            println!("[demo] private transfer submitted (nonce {}): {} INAZ to a fresh note", nonce, amount_inaz);
+            nonce += 1;
+            wait_notes(base + 4)?;
+            let p_bob = base + 2;
+            println!("[demo] private outputs sealed; bob's note at position {}", p_bob);
+
+            // ---- 3. unshield bob's note to a fresh public address --------
+            let bob_note = Note { sk: bob_sk, value: amount, rho: out_bob.rho };
+            let dummy = Note::new(0, &fr_rand);
+            let recip = Keypair::generate();
+            let zout = |_: u8| sc::OutputNote { owner: sh::owner_tag(fr_rand()), value: 0, rho: fr_rand() };
+            let tx = build_spend(
+                TxKind::Unshield,
+                [(&bob_note, p_bob), (&dummy, 0)],
+                [zout(0), zout(1)],
+                amount,
+                &recip.address(),
+                nonce,
+            )?;
+            submit(&tx)?;
+            println!("[demo] unshield submitted (nonce {}): {} INAZ -> {}", nonce, amount_inaz, recip.address());
+            wait_notes(base + 6)?;
+
+            // ---- 4. verify ------------------------------------------------
+            let bal = rpc_call(
+                &rpc_url,
+                "inaz_getBalance",
+                serde_json::json!({ "address": recip.address() }),
+            )?;
+            let got: u128 = bal["balance"].as_str().unwrap_or("0").parse().unwrap_or(0);
+            if got != amount {
+                return Err(format!(
+                    "unshield verification failed: recipient has {} rai, expected {}",
+                    got, amount
+                ));
+            }
+            let fin = rpc_call(&rpc_url, "inaz_shieldedInfo", serde_json::json!({}))?;
+            let pool: u128 = fin["poolBalance"].as_str().unwrap_or("0").parse().unwrap_or(0);
+            if pool != amount {
+                return Err(format!("pool balance {} rai, expected {} (the change note)", pool, amount));
+            }
+            println!("[demo] OK — shield -> private -> unshield round trip verified");
+            println!("[demo]   recipient {} balance {} INAZ", recip.address(), amount_inaz);
+            println!("[demo]   pool holds {} INAZ (change note), {} notes total", amount_inaz, fin["noteCount"]);
             Ok(())
         }
 
@@ -320,7 +554,8 @@ fn run() -> Result<(), String> {
             if !node.store.merkle_ready() {
                 println!("[state] building Merkle state tree, one time only...");
                 let t = std::time::Instant::now();
-                node.store.build_merkle_state();
+                node.store
+                    .build_merkle_state(node.store.tip_height().unwrap_or(0));
                 println!(
                     "[state] Merkle root {} in {:?}",
                     &node.store.merkle_root()[..16],
@@ -338,7 +573,10 @@ fn run() -> Result<(), String> {
             let net_height = types::best_peer_height();
             let behind = net_height > local_height + 2;
             let pending = if behind {
-                format!(" — local view at #{}, syncing to #{}", local_height, net_height)
+                format!(
+                    " — local view at #{}, syncing to #{}",
+                    local_height, net_height
+                )
             } else {
                 String::new()
             };
@@ -379,7 +617,11 @@ fn run() -> Result<(), String> {
                             "transport",
                             format!(
                                 "INSC1-{}",
-                                if network.require_encryption { "required" } else { "preferred" }
+                                if network.require_encryption {
+                                    "required"
+                                } else {
+                                    "preferred"
+                                }
                             ),
                         ),
                     ],
@@ -404,7 +646,10 @@ fn run() -> Result<(), String> {
                             if my_stake >= types::MIN_STAKE {
                                 "bonded".to_string()
                             } else {
-                                format!("unbonded (stake {} INAZ to validate)", format_inaz(types::MIN_STAKE))
+                                format!(
+                                    "unbonded (stake {} INAZ to validate)",
+                                    format_inaz(types::MIN_STAKE)
+                                )
                             },
                         ),
                     ],
@@ -424,73 +669,86 @@ fn run() -> Result<(), String> {
                 );
             }
             if hud {
-            ui::banner();
-            ui::panel(
-                "node",
-                &[
-                    ("chain id".into(), format!("{} (Inazuma)", node.genesis.chain_id)),
-                    ("validator".into(), me.clone()),
-                    ("node key".into(), node_id.pubkey_hex()),
-                    (
-                        "p2p".into(),
-                        format!(
-                            "INSC1 encrypted ({}), allowlist {}",
-                            if network.require_encryption { "required" } else { "preferred" },
-                            if network.allowed_ids.is_empty() {
-                                "off".to_string()
+                ui::banner();
+                ui::panel(
+                    "node",
+                    &[
+                        (
+                            "chain id".into(),
+                            format!("{} (Inazuma)", node.genesis.chain_id),
+                        ),
+                        ("validator".into(), me.clone()),
+                        ("node key".into(), node_id.pubkey_hex()),
+                        (
+                            "p2p".into(),
+                            format!(
+                                "INSC1 encrypted ({}), allowlist {}",
+                                if network.require_encryption {
+                                    "required"
+                                } else {
+                                    "preferred"
+                                },
+                                if network.allowed_ids.is_empty() {
+                                    "off".to_string()
+                                } else {
+                                    format!("{} keys", network.allowed_ids.len())
+                                }
+                            ),
+                        ),
+                        ("block time".into(), format!("{} ms", block_time)),
+                        (
+                            "mode".into(),
+                            if replica {
+                                "replica (serving only)".into()
+                            } else if node.solo() {
+                                "solo (no peers yet)".to_string()
                             } else {
-                                format!("{} keys", network.allowed_ids.len())
-                            }
+                                "networked".to_string()
+                            },
                         ),
-                    ),
-                    ("block time".into(), format!("{} ms", block_time)),
-                    (
-                        "mode".into(),
-                        if replica {
-                            "replica (serving only)".into()
-                        } else if node.solo() {
-                            "solo (no peers yet)".to_string()
-                        } else {
-                            "networked".to_string()
-                        },
-                    ),
-                    (
-                        "your stake".into(),
-                        format!(
-                            "{} INAZ (min {} to validate){}",
-                            format_inaz(my_stake),
-                            format_inaz(types::MIN_STAKE),
-                            pending
+                        (
+                            "your stake".into(),
+                            format!(
+                                "{} INAZ (min {} to validate){}",
+                                format_inaz(my_stake),
+                                format_inaz(types::MIN_STAKE),
+                                pending
+                            ),
                         ),
-                    ),
-                    (
-                        "network".into(),
-                        format!(
-                            "{} INAZ staked across {} validators{}",
-                            format_inaz(node.store.total_staked()),
-                            node.validators().len(),
-                            pending
+                        (
+                            "network".into(),
+                            format!(
+                                "{} INAZ staked across {} validators{}",
+                                format_inaz(node.store.total_staked()),
+                                node.validators().len(),
+                                pending
+                            ),
                         ),
-                    ),
-                    ("supply".into(), format!("{} INAZ", format_inaz(node.store.total_supply()))),
-                    ("rpc".into(), format!("http://{}", rpc_addr)),
-                    (
-                        "ws".into(),
-                        if ws_addr.is_empty() {
-                            "disabled".to_string()
-                        } else {
-                            format!("ws://{}", ws_addr)
-                        },
-                    ),
-                    (
-                        "state root".into(),
-                        format!("merkle from height {}", state::STATE_ROOT_V2_ACTIVATION_HEIGHT),
-                    ),
-                ],
-            );
-            ui::dashboard_link(&me);
-            ui::next_steps(&me, my_stake >= types::MIN_STAKE);
-            ui::commands(my_stake >= types::MIN_STAKE);
+                        (
+                            "supply".into(),
+                            format!("{} INAZ", format_inaz(node.store.total_supply())),
+                        ),
+                        ("rpc".into(), format!("http://{}", rpc_addr)),
+                        (
+                            "ws".into(),
+                            if ws_addr.is_empty() {
+                                "disabled".to_string()
+                            } else {
+                                format!("ws://{}", ws_addr)
+                            },
+                        ),
+                        (
+                            "state root".into(),
+                            format!(
+                                "merkle from height {}",
+                                state::STATE_ROOT_V2_ACTIVATION_HEIGHT
+                            ),
+                        ),
+                    ],
+                );
+                ui::dashboard_link(&me);
+                ui::next_steps(&me, my_stake >= types::MIN_STAKE);
+                ui::commands(my_stake >= types::MIN_STAKE);
             }
 
             let rpc_node = Arc::clone(&node);
@@ -599,26 +857,32 @@ fn run() -> Result<(), String> {
                 });
             }
 
+            #[cfg(feature = "byzantine")]
+            byzantine::banner();
+
             let mut tick = 0usize;
             let mut last_beat = std::time::Instant::now();
             // Empty blocks are logged sparsely: 400ms slots would otherwise bury
             // real events, exactly like geth does not log every idle sealing.
-            let mut last_empty_log = std::time::Instant::now()
-                - std::time::Duration::from_secs(30);
+            let mut last_empty_log = std::time::Instant::now() - std::time::Duration::from_secs(30);
             let mut synced_summary_shown = false;
             loop {
                 let started = std::time::Instant::now();
                 match node.produce_block() {
                     Ok(Some(b)) => {
                         let empty = b.transactions.is_empty();
-                        let show_empty = last_empty_log.elapsed()
-                            >= std::time::Duration::from_secs(10);
+                        let show_empty =
+                            last_empty_log.elapsed() >= std::time::Duration::from_secs(10);
                         if !hud && (!empty || show_empty) {
                             if empty {
                                 last_empty_log = std::time::Instant::now();
                             }
                             log::info(
-                                if empty { "Sealed new block" } else { "Imported new chain segment" },
+                                if empty {
+                                    "Sealed new block"
+                                } else {
+                                    "Imported new chain segment"
+                                },
                                 &[
                                     ("number", log::num(b.height)),
                                     ("hash", log::short(&b.hash)),
@@ -636,7 +900,14 @@ fn run() -> Result<(), String> {
                             );
                         }
                         p2p::announce_block(&network, &b);
+                        #[cfg(feature = "byzantine")]
+                        byzantine::after_seal(&node, &network, &b);
+                        #[cfg(not(feature = "byzantine"))]
                         p2p::vote_on(&node, &network, &b);
+                        #[cfg(feature = "byzantine")]
+                        if byzantine::should_vote() {
+                            p2p::vote_on(&node, &network, &b);
+                        }
                     }
                     Ok(None) => { /* another validator's slot */ }
                     Err(e) => {
@@ -653,6 +924,15 @@ fn run() -> Result<(), String> {
                 if last_beat.elapsed() >= std::time::Duration::from_millis(beat_every) {
                     last_beat = std::time::Instant::now();
                     tick += 1;
+                    // Finality reconciliation: recover precommits lost in
+                    // transit. One tiny request per peer, off the produce path.
+                    // Without this a single dropped vote stalls finality
+                    // forever on a 3-validator set (needs strictly >2/3).
+                    if tick % 4 == 1 && !node.solo() {
+                        let n = Arc::clone(&node);
+                        let p = Arc::clone(&network);
+                        std::thread::spawn(move || p2p::sync_votes(&n, &p));
+                    }
                     let height = node.store.tip_height().unwrap_or(0);
                     let v = node.validators().into_iter().find(|v| v.address == me);
                     let acct = node.store.account(&me);
@@ -717,10 +997,7 @@ fn run() -> Result<(), String> {
                                 "Chain synchronisation finished",
                                 &[
                                     ("height", log::num(height)),
-                                    (
-                                        "validators",
-                                        node.validators().len().to_string(),
-                                    ),
+                                    ("validators", node.validators().len().to_string()),
                                     (
                                         "netstake",
                                         format!("{} INAZ", format_inaz(node.store.total_staked())),
@@ -738,41 +1015,44 @@ fn run() -> Result<(), String> {
                                 ],
                             );
                         } else {
-                        ui::panel(
-                            "synced",
-                            &[
-                                ("height".into(), format!("#{} (finalized #{})", height, beat.finalized)),
-                                (
-                                    "your stake".into(),
-                                    format!(
-                                        "{} INAZ (min {} to validate)",
-                                        format_inaz(acct.staked),
-                                        format_inaz(types::MIN_STAKE)
+                            ui::panel(
+                                "synced",
+                                &[
+                                    (
+                                        "height".into(),
+                                        format!("#{} (finalized #{})", height, beat.finalized),
                                     ),
-                                ),
-                                (
-                                    "network".into(),
-                                    format!(
-                                        "{} INAZ staked across {} validators",
-                                        format_inaz(node.store.total_staked()),
-                                        node.validators().len()
-                                    ),
-                                ),
-                                (
-                                    "status".into(),
-                                    if beat.validating {
-                                        "validating — producing blocks".into()
-                                    } else if acct.staked >= types::MIN_STAKE {
-                                        "staked, joining the active set".to_string()
-                                    } else {
+                                    (
+                                        "your stake".into(),
                                         format!(
-                                            "not staked yet — run: inazuma stake --amount {}",
+                                            "{} INAZ (min {} to validate)",
+                                            format_inaz(acct.staked),
                                             format_inaz(types::MIN_STAKE)
-                                        )
-                                    },
-                                ),
-                            ],
-                        );
+                                        ),
+                                    ),
+                                    (
+                                        "network".into(),
+                                        format!(
+                                            "{} INAZ staked across {} validators",
+                                            format_inaz(node.store.total_staked()),
+                                            node.validators().len()
+                                        ),
+                                    ),
+                                    (
+                                        "status".into(),
+                                        if beat.validating {
+                                            "validating — producing blocks".into()
+                                        } else if acct.staked >= types::MIN_STAKE {
+                                            "staked, joining the active set".to_string()
+                                        } else {
+                                            format!(
+                                                "not staked yet — run: inazuma stake --amount {}",
+                                                format_inaz(types::MIN_STAKE)
+                                            )
+                                        },
+                                    ),
+                                ],
+                            );
                         }
                     }
                 }
@@ -824,7 +1104,11 @@ fn run() -> Result<(), String> {
             println!("mempool        {}", res["mempool"]);
             println!(
                 "sync           {}",
-                if syncing { "syncing — do not stake yet" } else { "in sync" }
+                if syncing {
+                    "syncing — do not stake yet"
+                } else {
+                    "in sync"
+                }
             );
             // Comparing against the public tip means telling the foundation's RPC
             // that this operator's node exists, so it is opt-in: pass
@@ -1039,9 +1323,10 @@ fn run() -> Result<(), String> {
                 nonce,
                 chain_id: CHAIN_ID,
                 payload: None,
+                shielded: None,
                 signature: String::new(),
             };
-            tx.signature = kp.sign_hex(&tx.signing_bytes());
+            tx.signature = kp.sign_hex(&tx.canonical_signing_bytes());
             let res = rpc_call(
                 &rpc_url,
                 "inaz_sendTransaction",
@@ -1071,7 +1356,10 @@ fn run() -> Result<(), String> {
                         &[
                             ("address".into(), kp.address()),
                             ("saved to".into(), path.clone()),
-                            ("backup".into(), "print the secret with: inazuma wallet --reveal".into()),
+                            (
+                                "backup".into(),
+                                "print the secret with: inazuma wallet --reveal".into(),
+                            ),
                         ],
                     );
                     println!("\nFund it, then run `inazuma stake --amount 1000`.");
@@ -1204,9 +1492,10 @@ fn run() -> Result<(), String> {
                 nonce,
                 chain_id: CHAIN_ID,
                 payload: None,
+                shielded: None,
                 signature: String::new(),
             };
-            tx.signature = kp.sign_hex(&tx.signing_bytes());
+            tx.signature = kp.sign_hex(&tx.canonical_signing_bytes());
             let res = rpc_call(
                 &rpc_url,
                 "inaz_sendTransaction",
@@ -1217,7 +1506,9 @@ fn run() -> Result<(), String> {
                 format_inaz(staked),
                 res["hash"].as_str().unwrap_or("?")
             );
-            println!("Keep the node running until the unbonding period ends, or you can be jailed.");
+            println!(
+                "Keep the node running until the unbonding period ends, or you can be jailed."
+            );
             Ok(())
         }
 
@@ -1267,9 +1558,10 @@ fn run() -> Result<(), String> {
                 nonce,
                 chain_id: CHAIN_ID,
                 payload: None,
+                shielded: None,
                 signature: String::new(),
             };
-            tx.signature = kp.sign_hex(&tx.signing_bytes());
+            tx.signature = kp.sign_hex(&tx.canonical_signing_bytes());
             let res = rpc_call(
                 &rpc_url,
                 "inaz_sendTransaction",
@@ -1420,9 +1712,10 @@ fn run() -> Result<(), String> {
                 nonce,
                 chain_id: CHAIN_ID,
                 payload,
+                shielded: None,
                 signature: String::new(),
             };
-            tx.signature = kp.sign_hex(&tx.signing_bytes());
+            tx.signature = kp.sign_hex(&tx.canonical_signing_bytes());
             let res = rpc_call(
                 &rpc_url,
                 "inaz_sendTransaction",
@@ -1513,9 +1806,10 @@ fn run() -> Result<(), String> {
                 nonce,
                 chain_id: CHAIN_ID,
                 payload,
+                shielded: None,
                 signature: String::new(),
             };
-            tx.signature = kp.sign_hex(&tx.signing_bytes());
+            tx.signature = kp.sign_hex(&tx.canonical_signing_bytes());
             let res = rpc_call(
                 &rpc_url,
                 "inaz_sendTransaction",
@@ -1635,9 +1929,10 @@ fn run() -> Result<(), String> {
                     nonce,
                     chain_id: CHAIN_ID,
                     payload: None,
+                    shielded: None,
                     signature: String::new(),
                 };
-                tx.signature = kp.sign_hex(&tx.signing_bytes());
+                tx.signature = kp.sign_hex(&tx.canonical_signing_bytes());
                 nonce += 1;
                 txs.push(tx);
             }
@@ -1717,10 +2012,14 @@ fn run() -> Result<(), String> {
         _ => {
             ui::banner();
             println!("Inazuma node (chain id {})\n", CHAIN_ID);
-            println!("  wallet-new                                create + save a validator wallet");
+            println!(
+                "  wallet-new                                create + save a validator wallet"
+            );
             println!("  wallet-import --key HEX                   import an existing secret key");
             println!("  wallet [--reveal]                         show address, balance and stake");
-            println!("  exit                                      unbond everything and leave the set");
+            println!(
+                "  exit                                      unbond everything and leave the set"
+            );
             println!("  keygen                                    create a new INAZ keypair");
             println!("  init    --data DIR --genesis FILE         seal genesis block 0");
             println!("  run     --data DIR --key HEX --rpc ADDR   run the node + JSON-RPC");
@@ -1728,7 +2027,9 @@ fn run() -> Result<(), String> {
             println!("  send    --key HEX --to ADDR --amount N    send INAZ");
             println!("  stake   --key HEX --amount N              stake INAZ");
             println!("  unstake --key HEX --amount N              unstake INAZ");
-            println!("  status  [--rpc URL]                       node height, peers and sync state");
+            println!(
+                "  status  [--rpc URL]                       node height, peers and sync state"
+            );
             println!("  validators                                show the validator set");
             println!("  balance --address ADDR                    read an account");
             println!("  token-create --key HEX --symbol S --name N --supply N [--decimals 9] [--mintable true]");

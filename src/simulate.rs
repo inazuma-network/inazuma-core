@@ -70,6 +70,14 @@ pub fn preflight(node: &Node, tx: &Transaction) -> Value {
             errors.push(format!("bad nonce: expected {}, got {}", pending, tx.nonce));
         }
         match tx.kind {
+            TxKind::Shield | TxKind::PrivateTransfer | TxKind::Unshield => {
+                let next = node.store.tip_height().unwrap_or(0) + 1;
+                if next < crate::shielded::activation_height() {
+                    errors.push("shielded pool is not active yet".into());
+                } else if let Err(e) = crate::chain::check_shielded_shape(tx) {
+                    errors.push(e);
+                }
+            }
             TxKind::Unstake => {
                 if tx.amount == 0 {
                     errors.push("unstake amount must be positive".into());

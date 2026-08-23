@@ -61,6 +61,11 @@ pub struct VoteTracker {
     evidence: Mutex<Vec<Evidence>>,
 }
 
+/// How many finalized heights' votes are retained for serving to lagging
+/// peers. 64 heights is ~26s of chain history per validator — nothing in
+/// memory, but enough for any live peer to reconcile finality.
+pub const VOTE_RETENTION_HEIGHTS: u64 = 64;
+
 #[derive(Debug)]
 pub struct VoteOutcome {
     /// True when this vote was new and worth gossiping onward.
@@ -126,7 +131,11 @@ impl VoteTracker {
                     });
                 }
                 // Bound the buffer by the set size, not by an arbitrary constant.
-                let cap = (set.len().max(1) * 64).min(4_096);
+                // 64/validator was ~25s of votes at 400ms slots: a node that
+                // briefly lagged under load evicted real precommits before the
+                // blocks landed, and on a 3-validator set one lost vote means
+                // that height can never finalize. 512/validator is ~3.4min.
+                let cap = (set.len().max(1) * 512).min(8_192);
                 if pending.len() >= cap {
                     pending.remove(0);
                 }
@@ -157,7 +166,10 @@ impl VoteTracker {
         if total > 0 && voted * 3 > total * 2 && vote.height > store.finalized_height() {
             store.set_finalized_height(vote.height);
             finalized = Some(vote.height);
-            guard.retain(|h, _| *h > vote.height);
+            // Keep a trailing window of finalized heights' votes instead of
+            // purging immediately: a peer whose finality lags ours must still
+            // be able to pull those precommits over getvotes and catch up.
+            guard.retain(|h, _| *h + VOTE_RETENTION_HEIGHTS > vote.height);
         }
         Ok(VoteOutcome { fresh, finalized })
     }
@@ -176,6 +188,26 @@ impl VoteTracker {
             None => 0,
         };
         (voted, total)
+    }
+
+    /// All counted votes at heights above `from`, oldest first. Served to
+    /// peers over `getvotes` so a vote lost in transit (dropped connection,
+    /// rate limit, pending-buffer eviction) is recovered by reconciliation
+    /// instead of being gone forever. With a 3-validator set finality needs
+    /// every single vote (2/3 of 3 equal stakes is not strictly greater), so
+    /// fire-and-forget gossip alone can never be enough on the real net.
+    pub fn votes_above(&self, from: u64, limit: usize) -> Vec<Vote> {
+        let guard = self.inner.lock().unwrap();
+        let mut out: Vec<Vote> = Vec::new();
+        for (h, at) in guard.iter() {
+            if *h <= from {
+                continue;
+            }
+            out.extend(at.values().cloned());
+        }
+        out.sort_by_key(|v| v.height);
+        out.truncate(limit);
+        out
     }
 
     pub fn seen(&self, height: u64) -> usize {

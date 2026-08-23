@@ -88,7 +88,7 @@ fn arr64(v: &[u8]) -> [u8; 64] {
     a
 }
 
-pub(crate) struct Aead2 {
+pub struct Aead2 {
     cipher: ChaCha20Poly1305,
     counter: u64,
 }
@@ -202,15 +202,10 @@ impl Channel {
                         Err(e.to_string())
                     };
                 }
-                let n = u32::from_be_bytes(len) as usize;
-                if n == 0 || n > MAX_FRAME {
-                    return Err("bad frame length".into());
-                }
+                let n = frame_len(&len)?;
                 let ct = read_exact(stream, n)?;
                 let plain = recv.open(&ct)?;
-                serde_json::from_slice(&plain)
-                    .map(Some)
-                    .map_err(|e| e.to_string())
+                decode_json(&plain)
             }
             Channel::Plain { reader, prefix, .. } => {
                 let mut line = String::from_utf8(std::mem::take(prefix)).unwrap_or_default();
@@ -218,18 +213,51 @@ impl Channel {
                 if read == 0 && line.is_empty() {
                     return Ok(None);
                 }
-                if line.len() > MAX_FRAME {
-                    return Err("oversized line".into());
-                }
-                if line.trim().is_empty() {
-                    return Ok(Some(Value::Null));
-                }
-                serde_json::from_str(&line)
-                    .map(Some)
-                    .map_err(|e| e.to_string())
+                decode_line(&line)
             }
         }
     }
+}
+
+// ------------------------------------------------------------- pure decoders
+//
+// Split out of `recv` so a fuzzer can drive the exact bytes an attacker controls
+// without a socket. Every rule an unauthenticated peer can trip lives here: any
+// panic, hang or unbounded allocation reachable from these three functions is a
+// remote DoS on every node on the network.
+
+/// Length prefix of an INSC1 frame. Rejects zero-length and oversized frames
+/// *before* any allocation, so a 4-byte header can never make the node reserve
+/// gigabytes.
+pub fn frame_len(head: &[u8; 4]) -> Result<usize, String> {
+    let n = u32::from_be_bytes(*head) as usize;
+    if n == 0 || n > MAX_FRAME {
+        return Err("bad frame length".into());
+    }
+    Ok(n)
+}
+
+/// Decrypted frame body -> message. Bounded by `MAX_FRAME` upstream.
+pub fn decode_json(plain: &[u8]) -> Result<Option<Value>, String> {
+    if plain.len() > MAX_FRAME {
+        return Err("oversized frame".into());
+    }
+    serde_json::from_slice(plain)
+        .map(Some)
+        .map_err(|e| e.to_string())
+}
+
+/// One legacy newline-delimited JSON line. Blank lines are a keepalive.
+pub fn decode_line(line: &str) -> Result<Option<Value>, String> {
+    if line.len() > MAX_FRAME {
+        return Err("oversized line".into());
+    }
+    if line.trim().is_empty() {
+        return Ok(Some(Value::Null));
+    }
+    serde_json::from_str(line)
+        .map(Some)
+        .map_err(|e| e.to_string())
 }
 
 /// Client side of the handshake on an already connected socket.

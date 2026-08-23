@@ -12,8 +12,7 @@ use crate::tokens::{self, format_units};
 use crate::types::{
     format_inaz, Block, Payload, Transaction, TxKind, DOWNTIME_JAIL_BLOCKS, DOWNTIME_JAIL_STREAK,
     DOWNTIME_REPEAT_BURN_BPS, EQUIVOCATION_CORRELATION_FACTOR, EQUIVOCATION_MIN_BURN_PCT,
-    EVIDENCE_MAX_AGE_BLOCKS, MIN_STAKE, REPORTER_BOUNTY_PCT, SLASHING_ACTIVATION_HEIGHT,
-    TOMBSTONE_HEIGHT, UNBONDING_BLOCKS,
+    EVIDENCE_MAX_AGE_BLOCKS, MIN_STAKE, REPORTER_BOUNTY_PCT, TOMBSTONE_HEIGHT, UNBONDING_BLOCKS,
 };
 use serde_json::{json, Value};
 use std::io::{Read, Write};
@@ -177,6 +176,15 @@ fn handle_conn(
         }
         let payload = match path {
             "/health" => json!({ "ok": true, "height": node.store.tip_height().unwrap_or(0) }),
+            // Scrape endpoint for Prometheus. Text format, no auth, no topology.
+            "/metrics" => {
+                return respond_typed(
+                    &mut stream,
+                    200,
+                    "text/plain; version=0.0.4",
+                    &crate::metrics::render(&node),
+                );
+            }
             _ => json!({
                 "chain": node.genesis.chain_name,
                 "chainId": node.genesis.chain_id,
@@ -383,6 +391,15 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
 }
 
 fn respond(stream: &mut TcpStream, status: u16, body: &str) -> Result<(), String> {
+    respond_typed(stream, status, "application/json", body)
+}
+
+fn respond_typed(
+    stream: &mut TcpStream,
+    status: u16,
+    content_type: &str,
+    body: &str,
+) -> Result<(), String> {
     let reason = match status {
         200 => "OK",
         204 => "No Content",
@@ -391,9 +408,10 @@ fn respond(stream: &mut TcpStream, status: u16, body: &str) -> Result<(), String
         _ => "Error",
     };
     let head = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: *\r\nAccess-Control-Allow-Methods: POST, GET, OPTIONS\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: *\r\nAccess-Control-Allow-Methods: POST, GET, OPTIONS\r\nConnection: close\r\n\r\n",
         status,
         reason,
+        content_type,
         body.len()
     );
     stream
@@ -678,6 +696,50 @@ fn dispatch(node: &Arc<Node>, method: &str, params: &Value) -> Result<Value, Str
                 "depth": crate::smt::DEPTH,
             }))
         }
+        // Shielded pool status: totals only. Parties and amounts of private
+        // transfers never appear here — that is the point of the pool.
+        "inaz_shieldedInfo" => {
+            let tip = node.store.tip_height().unwrap_or(0);
+            let count = node.store.shielded_leaf_count();
+            let leaves: Vec<ark_bn254::Fr> = node
+                .store
+                .shielded_leaves()
+                .iter()
+                .filter_map(|h| crate::poseidon::fr_from_hex(h))
+                .collect();
+            let root = crate::shielded::root_from_leaves(&leaves);
+            Ok(json!({
+                "active": tip + 1 >= crate::shielded::activation_height(),
+                "activationHeight": crate::shielded::activation_height(),
+                "noteCount": count,
+                "treeRoot": crate::poseidon::fr_to_hex(&root),
+                "poolBalance": node.store.shielded_pool_balance().to_string(),
+                "verifyingKeyInstalled": node.store.shielded_verifying_key().is_some(),
+                "height": tip,
+            }))
+        }
+        // Merkle authentication path for one note commitment, so wallets can
+        // build spend proofs without holding the whole tree.
+        "inaz_shieldedPath" => {
+            let pos = params
+                .get("position")
+                .and_then(|v| v.as_u64())
+                .ok_or("position required")?;
+            let leaves: Vec<ark_bn254::Fr> = node
+                .store
+                .shielded_leaves()
+                .iter()
+                .filter_map(|h| crate::poseidon::fr_from_hex(h))
+                .collect();
+            let path = crate::shielded::merkle_path(&leaves, pos as usize)
+                .map_err(|e| e.to_string())?;
+            let root = crate::shielded::root_from_leaves(&leaves);
+            Ok(json!({
+                "position": pos,
+                "root": crate::poseidon::fr_to_hex(&root),
+                "path": path.iter().map(crate::poseidon::fr_to_hex).collect::<Vec<_>>(),
+            }))
+        }
         "inaz_finalizedBlockNumber" => Ok(json!(node.store.finalized_height())),
         "inaz_finality" => {
             let tip = node.store.tip_height().unwrap_or(0);
@@ -787,8 +849,8 @@ fn dispatch(node: &Arc<Node>, method: &str, params: &Value) -> Result<Value, Str
             let burned: u128 = records.iter().map(|r| r.burned).sum();
             Ok(json!({
                 "height": height,
-                "activationHeight": SLASHING_ACTIVATION_HEIGHT,
-                "active": height >= SLASHING_ACTIVATION_HEIGHT,
+                "activationHeight": crate::types::slashing_activation(),
+                "active": height >= crate::types::slashing_activation(),
                 "params": {
                     "equivocationMinBurnPct": EQUIVOCATION_MIN_BURN_PCT,
                     "equivocationCorrelationFactor": EQUIVOCATION_CORRELATION_FACTOR,

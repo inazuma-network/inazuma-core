@@ -1,0 +1,17 @@
+{
+  "title": "Inazuma Network",
+  "uid": "inazuma-net",
+  "timezone": "utc",
+  "refresh": "15s",
+  "panels": [
+    { "type": "timeseries", "title": "Block height", "targets": [{ "expr": "inazuma_block_height" }], "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 } },
+    { "type": "timeseries", "title": "Finality lag (blocks)", "targets": [{ "expr": "inazuma_finality_lag_blocks" }], "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 } },
+    { "type": "timeseries", "title": "Peers", "targets": [{ "expr": "inazuma_peer_count" }], "gridPos": { "h": 8, "w": 8, "x": 0, "y": 8 } },
+    { "type": "timeseries", "title": "Mempool", "targets": [{ "expr": "inazuma_mempool_txs" }], "gridPos": { "h": 8, "w": 8, "x": 8, "y": 8 } },
+    { "type": "timeseries", "title": "TPS (5m rate)", "targets": [{ "expr": "rate(inazuma_txs_total[5m])" }], "gridPos": { "h": 8, "w": 8, "x": 16, "y": 8 } },
+    { "type": "stat", "title": "Validators", "targets": [{ "expr": "max(inazuma_validators)" }], "gridPos": { "h": 6, "w": 6, "x": 0, "y": 16 } },
+    { "type": "stat", "title": "Distinct state roots", "targets": [{ "expr": "count(count by (state_root) (inazuma_state_root_info))" }], "gridPos": { "h": 6, "w": 6, "x": 6, "y": 16 } },
+    { "type": "stat", "title": "Halted nodes", "targets": [{ "expr": "sum(inazuma_halted)" }], "gridPos": { "h": 6, "w": 6, "x": 12, "y": 16 } },
+    { "type": "stat", "title": "Total staked (rai)", "targets": [{ "expr": "max(inazuma_total_staked_rai)" }], "gridPos": { "h": 6, "w": 6, "x": 18, "y": 16 } }
+  ]
+}
